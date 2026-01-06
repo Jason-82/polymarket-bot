@@ -1,0 +1,87 @@
+# Polymarket Trading Bot - Strategy Configuration
+#
+# This file defines which strategies to run and their parameters.
+# Strategies are modular and can be swapped without code changes.
+
+strategies:
+  # =============================================================================
+  # MARKET MAKER STRATEGY
+  # =============================================================================
+  # Passive two-sided quoter that provides liquidity by quoting
+  # bid and ask prices around the midpoint.
+  #
+  # WARNING: Market making is risky. You can lose money if:
+  # - Prices move against you quickly (adverse selection)
+  # - You accumulate too much inventory
+  # - Spreads are too tight relative to volatility
+  #
+  - name: market_maker
+    enabled: false  # Set to true to enable
+    params:
+      # Spread settings
+      min_spread: 0.02      # Minimum 2 cent spread
+      target_spread: 0.04   # Target 4 cent spread
+
+      # Size settings
+      quote_size: 10        # Quote size per side
+      max_position: 100     # Max position before stopping
+
+      # Inventory management
+      inventory_skew: 0.001       # Price skew per share of inventory
+      reduce_size_on_inventory: true
+
+      # Quote management
+      requote_threshold: 0.005    # Min change to requote
+
+    # Tokens to quote (add token IDs here)
+    tokens: []
+
+  # =============================================================================
+  # VALUE THRESHOLD STRATEGY
+  # =============================================================================
+  # Directional strategy that trades when prices deviate significantly
+  # from a fair value estimate.
+  #
+  # By default, uses the current midpoint as "fair value" which means
+  # it won't trade. You need to set fair_value_overrides or implement
+  # a custom fair value model.
+  #
+  - name: value_threshold
+    enabled: false
+    params:
+      # Threshold settings
+      entry_threshold: 0.05   # 5 cent deviation to enter
+      exit_threshold: 0.02    # 2 cent deviation to exit
+
+      # Position sizing
+      order_size: 20
+      max_position: 100
+
+      # Fair value settings
+      use_midpoint_as_fair_value: false  # Set to false if using overrides
+
+      # Manual fair value overrides
+      # Map token_id -> your estimate of fair value (0-1)
+      fair_value_overrides: {}
+        # "0x123abc...": 0.65  # Your belief: 65% chance of YES
+
+    tokens: []
+
+# =============================================================================
+# HOW TO ADD A NEW STRATEGY
+# =============================================================================
+#
+# 1. Create a new file in strategies/ (e.g., my_strategy.py)
+# 2. Inherit from StrategyBase and implement on_tick() and get_risk_budget()
+# 3. Register with @register_strategy("my_strategy")
+# 4. Add configuration here with name: "my_strategy"
+# 5. Set enabled: true and add tokens to trade
+#
+# Example:
+#   - name: my_strategy
+#     enabled: true
+#     params:
+#       my_param: 42
+#     tokens:
+#       - "0xabc..."
+#       - "0xdef..."

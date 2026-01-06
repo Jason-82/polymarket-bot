@@ -1,0 +1,88 @@
+# Polymarket Trading Bot - Main Configuration
+# This file contains the primary configuration for the bot.
+# Sensitive values should use environment variables.
+
+# Operating mode: READ_ONLY, PAPER, or LIVE
+mode: READ_ONLY
+
+# Chain ID (Polygon mainnet = 137)
+chain_id: 137
+
+# API endpoints
+api:
+  clob_rest_url: "https://clob.polymarket.com"
+  gamma_url: "https://gamma-api.polymarket.com"
+  data_api_url: "https://data-api.polymarket.com"
+  clob_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/"
+  geoblock_url: "https://polymarket.com/api/geoblock"
+
+# Risk limits (see config/risk.yaml for detailed settings)
+risk:
+  max_order_size_per_token: 100
+  max_total_open_notional: 1000
+  max_net_exposure_per_market: 500
+  max_total_exposure: 2000
+  max_daily_loss: 100
+  max_drawdown_pct: 0.1
+  min_order_update_interval_ms: 1000
+  price_epsilon: 0.001
+
+# Strategy configurations
+strategies:
+  - name: market_maker
+    enabled: false
+    params:
+      min_spread: 0.02
+      target_spread: 0.04
+      quote_size: 10
+      max_position: 100
+      inventory_skew: 0.001
+    tokens: []  # Add token IDs to trade
+
+  - name: value_threshold
+    enabled: false
+    params:
+      entry_threshold: 0.05
+      exit_threshold: 0.02
+      order_size: 20
+      max_position: 100
+      use_midpoint_as_fair_value: true
+    tokens: []
+
+# Universe selection filters
+universe_filters:
+  # Uncomment to filter by specific markets or tokens
+  # market_ids: []
+  # token_ids: []
+
+  # Filter by category
+  # categories: ["politics", "sports"]
+  # exclude_categories: []
+
+  # Minimum liquidity/volume
+  min_liquidity: 1000
+  min_volume: 0
+
+  # Time filters
+  min_days_to_expiry: 1
+  # max_days_to_expiry: 365
+
+  # Status
+  active_only: true
+  exclude_closed: true
+
+  # Limit number of markets
+  max_markets: 50
+
+# Database
+database_path: "data/polymarket.db"
+
+# Logging
+log_level: "INFO"
+# log_file: "logs/bot.log"
+
+# Timing intervals (seconds)
+tick_interval: 1.0
+geoblock_check_interval: 21600  # 6 hours
+universe_refresh_interval: 3600  # 1 hour
+position_reconcile_interval: 300  # 5 minutes
