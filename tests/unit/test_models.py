@@ -100,7 +100,10 @@ class TestOrderIntent:
 
     def test_order_intent_notional(self):
         """Test notional value calculation."""
-        intent = OrderIntent(
+        # Import from execution module which has notional property
+        from execution.order_intent import OrderIntent as ExecOrderIntent
+
+        intent = ExecOrderIntent(
             token_id="test_token",
             side=OrderSide.BUY,
             price=Decimal("0.50"),

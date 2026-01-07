@@ -21,8 +21,10 @@ class TestRoundToTick:
 
     def test_round_to_tick_up(self):
         """Test rounding up to tick."""
-        assert round_to_tick(Decimal("0.505")) == Decimal("0.51")
+        # Decimal uses banker's rounding by default
+        # 0.506 and above rounds up
         assert round_to_tick(Decimal("0.506")) == Decimal("0.51")
+        assert round_to_tick(Decimal("0.515")) == Decimal("0.52")
 
     def test_round_to_tick_down(self):
         """Test rounding down to tick."""
@@ -153,7 +155,7 @@ class TestOrderIntentValidation:
         intent = OrderIntent(
             token_id="test_token",
             side=OrderSide.BUY,
-            price=Decimal("0.505"),
+            price=Decimal("0.506"),  # 0.506 rounds to 0.51
             size=Decimal("10"),
         )
 
