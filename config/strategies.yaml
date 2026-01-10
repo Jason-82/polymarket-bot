@@ -67,6 +67,64 @@ strategies:
 
     tokens: []
 
+  # =============================================================================
+  # NEWS ALPHA STRATEGY (AI-Powered News Trading)
+  # =============================================================================
+  # Event-driven strategy that monitors news in real-time, uses Claude AI
+  # to reason about market impact, and places trades faster than humans.
+  #
+  # EDGE: Speed + AI reasoning on second-order effects
+  #
+  # REQUIREMENTS:
+  # - Twitter API bearer token (for real-time news)
+  # - Claude API key (for reasoning)
+  # - VPN connection (for Polymarket access)
+  #
+  # RISK DEFAULTS (for ~$100k allocated capital):
+  # - $500 base order, scaling to $2k on high-confidence signals
+  # - $5k max per market, $10k daily exposure cap
+  # - 75% minimum confidence threshold
+  #
+  - name: news_alpha
+    enabled: true   # <-- SET TO TRUE TO ACTIVATE
+    params:
+      # ----- API Keys (override in .env, not here) -----
+      # twitter_bearer_token: ${TWITTER_BEARER_TOKEN}
+      # claude_api_key: ${ANTHROPIC_API_KEY}
+
+      # ----- News Sources -----
+      enable_twitter: true          # Real-time tweets from key accounts
+      enable_rss: true              # Backup from Reuters, AP, etc.
+      twitter_poll_interval: 15     # Seconds between Twitter checks
+      rss_poll_interval: 60         # Seconds between RSS checks
+
+      # ----- LLM Reasoning -----
+      llm_model: "claude-sonnet-4-20250514"   # Fast + smart
+      llm_temperature: 0.3          # Lower = more consistent
+      min_confidence: 75            # Only trade 75%+ confidence signals
+      min_edge: 0.03                # Minimum 3 cent edge to trade
+
+      # ----- Position Sizing (for ~$100k portfolio) -----
+      base_order_size: 500          # $500 base bet
+      max_order_size: 2000          # $2000 max per signal
+      max_position_per_market: 5000 # $5k max exposure per market
+      max_daily_exposure: 10000     # $10k total daily cap
+      max_signals_per_day: 20       # Rate limit
+
+      # ----- Timing -----
+      max_news_age_seconds: 300     # Ignore news > 5 min old
+      signal_cooldown_seconds: 60   # Min 1 min between trades on same market
+
+      # ----- Focus Categories -----
+      # Change these to shift focus (politics, world_events, economics, crypto, sports)
+      enabled_categories:
+        - politics
+        - world_events
+        - economics
+
+    # Tokens: empty = trade all matching markets
+    tokens: []
+
 # =============================================================================
 # HOW TO ADD A NEW STRATEGY
 # =============================================================================

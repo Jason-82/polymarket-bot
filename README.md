@@ -101,7 +101,22 @@ polymarket-bot/
 
 ## Strategies
 
-Two baseline strategies are included as scaffolding:
+Three strategies are included:
+
+### News Alpha (AI-Powered News Trading)
+- **Real-time news monitoring** from Twitter and RSS feeds
+- **Claude AI reasoning** to analyze market impact of news
+- **Speed edge**: Reacts to news faster than human traders
+- **Second-order effects**: AI finds non-obvious connections (e.g., Venezuela → oil → inflation)
+
+**Requirements:**
+- Twitter API Bearer Token (from developer.twitter.com)
+- Anthropic API Key (from console.anthropic.com)
+
+**Risk defaults (for ~$100k portfolio):**
+- $500 base bet, scaling to $2k on high-confidence signals
+- $5k max per market, $10k daily exposure cap
+- 75% minimum AI confidence to trade
 
 ### Market Maker
 - Quotes bid/ask around midpoint with configurable spread
