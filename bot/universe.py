@@ -143,7 +143,13 @@ class UniverseSelector:
 
         # Time-to-expiry filters
         if market.end_date:
-            days_to_expiry = (market.end_date - datetime.utcnow()).days
+            # Handle timezone-aware vs naive datetime comparison
+            end_date = market.end_date
+            now = datetime.utcnow()
+            # Strip timezone if present to make comparison work
+            if end_date.tzinfo is not None:
+                end_date = end_date.replace(tzinfo=None)
+            days_to_expiry = (end_date - now).days
             if days_to_expiry < f.min_days_to_expiry:
                 return False
             if f.max_days_to_expiry is not None:

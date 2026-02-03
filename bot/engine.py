@@ -2,6 +2,7 @@
 
 import asyncio
 import signal
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -386,6 +387,12 @@ class TradingEngine:
 
     def _setup_signal_handlers(self) -> None:
         """Setup OS signal handlers for graceful shutdown."""
+        # Signal handlers only work on Unix systems, not Windows
+        if sys.platform == "win32":
+            # On Windows, Ctrl+C will raise KeyboardInterrupt which is caught in main
+            logger.debug("signal_handlers_skipped", reason="Windows platform")
+            return
+
         loop = asyncio.get_event_loop()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
