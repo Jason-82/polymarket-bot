@@ -142,7 +142,8 @@ class NewsAlphaStrategy(StrategyBase):
     """
 
     def __init__(self, name: str, params: Dict[str, Any], tokens: List[str]):
-        super().__init__(name, params, tokens)
+        super().__init__(name=name, config=params)
+        self.tokens = tokens
         self.config = NewsAlphaConfig.from_dict(params)
 
         # Components (initialized in start())
