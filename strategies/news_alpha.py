@@ -24,6 +24,7 @@ from connectors.news_sources.twitter_client import TwitterConfig, MockTwitterSou
 from connectors.news_sources.rss_client import RSSConfig
 from reasoning import LLMAnalyzer, TradeSignal, SignalDirection, MarketMapper
 from reasoning.llm_analyzer import LLMConfig
+from reasoning.cross_market_analyzer import CrossMarketAnalyzer, RelatedMarket
 from execution.order_intent import OrderIntent, OrderSide
 from monitoring.logger import get_logger
 
@@ -48,6 +49,12 @@ class NewsAlphaConfig:
     llm_temperature: float = 0.3
     min_confidence: float = 75.0         # Minimum confidence to trade
     min_edge: float = 0.03               # Minimum 3 cent edge
+
+    # Cross-Market Analysis
+    enable_cross_market: bool = True     # Find related markets on news
+    cross_market_min_confidence: float = 60.0  # Lower threshold for related markets
+    max_related_markets: int = 5         # Max additional markets to trade per signal
+    min_lag_seconds: int = 30            # Only trade lagging markets with this much lag
 
     # Risk / Position Sizing
     base_order_size: Decimal = Decimal("500")   # $500 base size
@@ -82,6 +89,10 @@ class NewsAlphaConfig:
             llm_temperature=data.get("llm_temperature", 0.3),
             min_confidence=data.get("min_confidence", 75.0),
             min_edge=data.get("min_edge", 0.03),
+            enable_cross_market=data.get("enable_cross_market", True),
+            cross_market_min_confidence=data.get("cross_market_min_confidence", 60.0),
+            max_related_markets=data.get("max_related_markets", 5),
+            min_lag_seconds=data.get("min_lag_seconds", 30),
             base_order_size=Decimal(str(data.get("base_order_size", 500))),
             max_order_size=Decimal(str(data.get("max_order_size", 2000))),
             max_position_per_market=Decimal(str(data.get("max_position_per_market", 5000))),
@@ -135,6 +146,7 @@ class NewsAlphaStrategy(StrategyBase):
         self._aggregator: Optional[NewsAggregator] = None
         self._analyzer: Optional[LLMAnalyzer] = None
         self._mapper: Optional[MarketMapper] = None
+        self._cross_market_analyzer: Optional[CrossMarketAnalyzer] = None
 
         # State
         self._running = False
@@ -142,6 +154,9 @@ class NewsAlphaStrategy(StrategyBase):
         self._recent_signals: Dict[str, datetime] = {}  # market_id -> last signal time
         self._processed_news: Set[str] = set()  # news IDs already processed
         self._daily_stats = DailyStats()
+
+        # Cache all markets for cross-market analysis
+        self._all_markets: List[Dict[str, Any]] = []
 
         # Background task
         self._processing_task: Optional[asyncio.Task] = None
@@ -166,6 +181,16 @@ class NewsAlphaStrategy(StrategyBase):
             )
             self._analyzer = LLMAnalyzer(llm_config)
             await self._analyzer.connect()
+
+            # Initialize cross-market analyzer if enabled
+            if self.config.enable_cross_market:
+                self._cross_market_analyzer = CrossMarketAnalyzer(
+                    api_key=self.config.claude_api_key,
+                    model=self.config.llm_model,
+                    timeout_seconds=self.config.analysis_timeout_seconds + 15,  # Extra time for larger analysis
+                )
+                await self._cross_market_analyzer.connect()
+                logger.info("news_alpha_cross_market_enabled")
         else:
             logger.warning("news_alpha_no_claude_key", msg="LLM analysis disabled")
 
@@ -226,6 +251,9 @@ class NewsAlphaStrategy(StrategyBase):
 
         if self._analyzer:
             await self._analyzer.disconnect()
+
+        if self._cross_market_analyzer:
+            await self._cross_market_analyzer.disconnect()
 
         logger.info("news_alpha_stopped")
 
@@ -322,6 +350,10 @@ class NewsAlphaStrategy(StrategyBase):
                 for signal in result.signals:
                     await self._handle_signal(signal)
 
+                # Cross-market analysis: find related markets that may lag
+                if self._cross_market_analyzer and self.config.enable_cross_market:
+                    await self._analyze_cross_markets(event, result.signals, current_prices)
+
     async def _handle_signal(self, signal: TradeSignal) -> None:
         """Handle a trade signal from analysis."""
         # Check cooldown
@@ -358,6 +390,112 @@ class NewsAlphaStrategy(StrategyBase):
         self._daily_stats.signals_generated += 1
         self._daily_stats.total_exposure += size
 
+    async def _analyze_cross_markets(
+        self,
+        event: NewsEvent,
+        primary_signals: List[TradeSignal],
+        current_prices: Dict[str, Decimal],
+    ) -> None:
+        """
+        Analyze related markets for additional trading opportunities.
+
+        When we get a signal on a primary market, check for:
+        1. Logically related markets that should move together
+        2. Markets where price updates may lag (trading opportunities)
+        3. Second-order effects that take time to play out
+        """
+        if not primary_signals or not self._cross_market_analyzer:
+            return
+
+        # Use the highest confidence primary signal
+        primary_signal = max(primary_signals, key=lambda s: s.confidence)
+
+        # Find the primary market in our cached markets
+        primary_market = None
+        for market in self._all_markets:
+            mid = market.get("condition_id", market.get("id", ""))
+            if mid == primary_signal.market_id:
+                primary_market = market
+                break
+
+        if not primary_market:
+            logger.debug("cross_market_primary_not_found", market_id=primary_signal.market_id)
+            return
+
+        try:
+            # Run cross-market analysis
+            analysis = await self._cross_market_analyzer.find_related_markets(
+                news_event=event,
+                primary_market=primary_market,
+                all_markets=self._all_markets,
+                current_prices=current_prices,
+            )
+
+            if not analysis.trading_opportunities:
+                logger.debug("cross_market_no_opportunities", primary=primary_signal.market_id)
+                return
+
+            logger.info(
+                "cross_market_opportunities_found",
+                primary=primary_signal.market_id,
+                related_count=len(analysis.related_markets),
+                opportunities=len(analysis.trading_opportunities),
+            )
+
+            # Generate signals for promising related markets
+            signals_generated = 0
+            for opp in analysis.trading_opportunities[:self.config.max_related_markets]:
+                # Skip if confidence too low
+                if opp["confidence"] < self.config.cross_market_min_confidence:
+                    continue
+
+                # Skip if no lag (already priced in)
+                if opp["lag_seconds"] < self.config.min_lag_seconds:
+                    continue
+
+                # Skip if already traded recently
+                if opp["market_id"] in self._recent_signals:
+                    last = self._recent_signals[opp["market_id"]]
+                    if (datetime.utcnow() - last).total_seconds() < self.config.signal_cooldown_seconds:
+                        continue
+
+                # Determine direction based on primary signal and relationship
+                if opp["expected_direction"] == "same":
+                    direction = primary_signal.direction
+                elif opp["expected_direction"] == "opposite":
+                    direction = (
+                        SignalDirection.SELL if primary_signal.direction == SignalDirection.BUY
+                        else SignalDirection.BUY
+                    )
+                else:
+                    # Uncertain direction - skip
+                    continue
+
+                # Create signal for related market
+                related_signal = TradeSignal(
+                    market_id=opp["market_id"],
+                    token_id=opp["token_id"],
+                    direction=direction,
+                    confidence=opp["confidence"] * 0.9,  # Slight discount for indirect signal
+                    reasoning=f"Cross-market ({opp['relationship']}): {opp['reasoning']}",
+                    news_event_id=event.id,
+                    suggested_size_pct=50.0,  # Half size for related markets
+                    urgency="normal",
+                )
+
+                await self._handle_signal(related_signal)
+                signals_generated += 1
+
+            if signals_generated > 0:
+                logger.info(
+                    "cross_market_signals_generated",
+                    count=signals_generated,
+                    primary=primary_signal.market_id,
+                )
+
+        except Exception as e:
+            logger.error("cross_market_analysis_error", error=str(e))
+
     def _calculate_size(self, signal: TradeSignal) -> Decimal:
         """Calculate order size based on signal strength."""
         # Base size scaled by confidence
@@ -382,11 +520,30 @@ class NewsAlphaStrategy(StrategyBase):
         For news alpha, most work happens in background processing.
         on_tick is used to:
         1. Update market mapper with fresh market data
-        2. Convert pending signals to order intents
+        2. Cache all markets for cross-market analysis
+        3. Convert pending signals to order intents
         """
         # Update market metadata
         if self._mapper:
             self._mapper.update_markets(list(context.market_metadata.values()))
+
+        # Cache all markets for cross-market analysis
+        # Convert Market objects to dicts for the analyzer
+        self._all_markets = [
+            {
+                "condition_id": m.condition_id,
+                "id": m.market_id,
+                "question": m.question or m.title,
+                "title": m.title,
+                "description": m.description,
+                "category": m.category,
+                "tokens": [
+                    {"token_id": t.token_id, "outcome": t.outcome}
+                    for t in m.tokens
+                ],
+            }
+            for m in context.market_metadata.values()
+        ]
 
         # For now, signals are logged but not converted to intents
         # Full implementation would maintain a signal queue and convert here

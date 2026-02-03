@@ -6,8 +6,9 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from bot.config import RiskLimits
-from storage.models import OrderIntent, OrderSide, OrderType, Position, Order
+from storage.models import OrderIntent, OrderSide, OrderType, Position, Order, OrderBook, Market
 from execution.order_intent import TICK_SIZE, MIN_PRICE, MAX_PRICE, round_to_tick, clamp_price
+from risk.arbitrage_checker import ArbitrageChecker, ArbitrageCheckResult
 from monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -37,7 +38,7 @@ class RiskManager:
     - Kill switch management
     """
 
-    def __init__(self, limits: RiskLimits):
+    def __init__(self, limits: RiskLimits, enable_arbitrage_check: bool = True):
         self.limits = limits
 
         # Tracking
@@ -50,6 +51,13 @@ class RiskManager:
         # Kill switch state
         self._kill_switch_active = False
         self._kill_switch_reason: Optional[str] = None
+
+        # Arbitrage checker for defensive checks
+        self._enable_arbitrage_check = enable_arbitrage_check
+        self._arbitrage_checker = ArbitrageChecker(
+            block_threshold=Decimal("0.05"),  # Block trades when mispricing > 5 cents
+            warn_threshold=Decimal("0.02"),   # Warn when mispricing > 2 cents
+        ) if enable_arbitrage_check else None
 
     @property
     def is_halted(self) -> bool:
@@ -68,6 +76,9 @@ class RiskManager:
         open_orders: List[Order],
         geoblock_allowed: bool,
         mode: str,
+        orderbooks: Optional[Dict[str, OrderBook]] = None,
+        markets: Optional[Dict[str, Market]] = None,
+        token_to_market: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[OrderIntent], Dict[str, str]]:
         """
         Apply risk limits to order intents.
@@ -101,6 +112,28 @@ class RiskManager:
         current_open_notional = sum(o.remaining_size * o.price for o in open_orders)
 
         for intent in intents:
+            # First check arbitrage safety
+            if self._arbitrage_checker and orderbooks and markets and token_to_market:
+                arb_result = self._check_arbitrage_safety(
+                    intent, orderbooks, markets, token_to_market
+                )
+                if arb_result.should_block:
+                    adjustments[intent.client_order_id] = f"arbitrage_blocked: {arb_result.warning}"
+                    logger.warning(
+                        "risk_arbitrage_blocked",
+                        token_id=intent.token_id,
+                        warning=arb_result.warning,
+                        recommendation=arb_result.recommendation,
+                    )
+                    continue
+                elif arb_result.warning:
+                    logger.info(
+                        "risk_arbitrage_warning",
+                        token_id=intent.token_id,
+                        warning=arb_result.warning,
+                    )
+
+            # Standard risk checks
             result, adjusted_intent = self._check_intent(
                 intent, positions, current_exposure, current_open_notional
             )
@@ -217,6 +250,64 @@ class RiskManager:
 
         return RiskCheckResult(passed=True, adjustments=adjustments), intent
 
+    def _check_arbitrage_safety(
+        self,
+        intent: OrderIntent,
+        orderbooks: Dict[str, OrderBook],
+        markets: Dict[str, Market],
+        token_to_market: Dict[str, str],
+    ) -> ArbitrageCheckResult:
+        """Check if a trade is safe from arbitrage perspective."""
+        if not self._arbitrage_checker:
+            return ArbitrageCheckResult(is_safe=True)
+
+        # Find the market for this token
+        market_id = token_to_market.get(intent.token_id)
+        if not market_id:
+            return ArbitrageCheckResult(is_safe=True, warning="Unknown market")
+
+        market = markets.get(market_id)
+        if not market:
+            return ArbitrageCheckResult(is_safe=True, warning="Market not found")
+
+        # Get YES and NO orderbooks
+        yes_token = market.yes_token
+        no_token = market.no_token
+
+        if not yes_token or not no_token:
+            return ArbitrageCheckResult(is_safe=True, warning="Missing YES/NO tokens")
+
+        yes_ob = orderbooks.get(yes_token.token_id)
+        no_ob = orderbooks.get(no_token.token_id)
+
+        return self._arbitrage_checker.check_trade(
+            market=market,
+            side=intent.side,
+            price=intent.price,
+            yes_orderbook=yes_ob,
+            no_orderbook=no_ob,
+        )
+
+    def scan_for_arbitrage(
+        self,
+        markets: List[Market],
+        orderbooks: Dict[str, OrderBook],
+    ) -> Dict[str, Any]:
+        """
+        Scan all markets for arbitrage opportunities.
+
+        Returns stats about detected opportunities for monitoring.
+        """
+        if not self._arbitrage_checker:
+            return {"enabled": False}
+
+        opportunities = self._arbitrage_checker.scan_all_markets(markets, orderbooks)
+        stats = self._arbitrage_checker.get_stats()
+        stats["enabled"] = True
+        stats["current_opportunities"] = len(opportunities)
+
+        return stats
+
     def should_halt(
         self,
         daily_pnl: Decimal,
@@ -285,7 +376,7 @@ class RiskManager:
         if self._peak_value > 0:
             drawdown = (self._peak_value - self._current_value) / self._peak_value
 
-        return {
+        status = {
             "kill_switch_active": self._kill_switch_active,
             "kill_switch_reason": self._kill_switch_reason,
             "daily_pnl": str(self._daily_pnl),
@@ -298,5 +389,12 @@ class RiskManager:
                 "max_drawdown_pct": str(self.limits.max_drawdown_pct),
                 "max_order_size": str(self.limits.max_order_size_per_token),
                 "max_exposure": str(self.limits.max_total_exposure),
-            }
+            },
+            "arbitrage_check_enabled": self._enable_arbitrage_check,
         }
+
+        # Add arbitrage stats if enabled
+        if self._arbitrage_checker:
+            status["arbitrage_stats"] = self._arbitrage_checker.get_stats()
+
+        return status

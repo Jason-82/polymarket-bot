@@ -7,8 +7,9 @@ from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Set
 import time
 
-from storage.models import Order, Fill, OrderIntent, OrderSide, OrderType, TradeMode
+from storage.models import Order, Fill, OrderIntent, OrderSide, OrderType, TradeMode, OrderBook
 from execution.order_intent import round_to_tick
+from execution.orderbook_analyzer import OrderBookAnalyzer, estimate_execution_cost
 from monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -43,11 +44,13 @@ class OrderManagementSystem:
         mode: str = "PAPER",  # PAPER or LIVE
         min_update_interval_ms: int = 1000,
         price_epsilon: Decimal = Decimal("0.001"),
+        max_slippage_pct: Decimal = Decimal("0.05"),
         on_fill: Optional[Callable[[Fill], None]] = None,
     ):
         self.mode = mode
         self.min_update_interval_ms = min_update_interval_ms
         self.price_epsilon = price_epsilon
+        self.max_slippage_pct = max_slippage_pct
         self._on_fill = on_fill
 
         # Order tracking
@@ -59,6 +62,11 @@ class OrderManagementSystem:
 
         # Paper trading fill simulator
         self._paper_fills: List[Fill] = []
+
+        # Order book analyzer for execution quality
+        self._ob_analyzer = OrderBookAnalyzer(
+            max_slippage_pct=max_slippage_pct,
+        )
 
     def set_trading_client(self, client) -> None:
         """Set the trading client for live mode."""
@@ -314,12 +322,15 @@ class OrderManagementSystem:
         token_id: str,
         orderbook: Dict[str, Any],
     ) -> None:
-        """Check for simulated fills in paper mode."""
+        """Check for simulated fills in paper mode with VWAP-based pricing."""
         if not orderbook:
             return
 
         best_bid = orderbook.get("best_bid")
         best_ask = orderbook.get("best_ask")
+
+        # Try to get full orderbook for VWAP calculation
+        full_orderbook = orderbook.get("_full_orderbook")  # OrderBook object if available
 
         for coid, state in list(self._orders.items()):
             if state.status != "open":
@@ -328,17 +339,36 @@ class OrderManagementSystem:
                 continue
 
             fill = None
+            fill_price = None
 
             if state.intent.side == OrderSide.BUY:
                 # Buy order fills if price >= best_ask
                 if best_ask and state.intent.price >= best_ask:
+                    # Use VWAP if full orderbook available
+                    if full_orderbook:
+                        vwap_result = self._ob_analyzer.calculate_vwap(
+                            full_orderbook, OrderSide.BUY, state.intent.size
+                        )
+                        if vwap_result.fully_filled:
+                            fill_price = vwap_result.vwap
+                        else:
+                            # Partial fill at VWAP
+                            fill_price = vwap_result.vwap
+                            logger.debug(
+                                "oms_paper_partial_fill",
+                                requested=str(state.intent.size),
+                                available=str(vwap_result.total_size_available),
+                            )
+                    else:
+                        fill_price = best_ask
+
                     fill = Fill(
                         fill_id=f"paper_fill_{coid}_{int(time.time())}",
                         order_id=state.exchange_order_id or coid,
                         client_order_id=coid,
                         token_id=token_id,
                         side=OrderSide.BUY,
-                        price=best_ask,  # Fill at best ask
+                        price=fill_price,
                         size=state.intent.size,
                         fee=Decimal("0"),
                         timestamp=datetime.utcnow(),
@@ -347,13 +377,25 @@ class OrderManagementSystem:
             else:
                 # Sell order fills if price <= best_bid
                 if best_bid and state.intent.price <= best_bid:
+                    # Use VWAP if full orderbook available
+                    if full_orderbook:
+                        vwap_result = self._ob_analyzer.calculate_vwap(
+                            full_orderbook, OrderSide.SELL, state.intent.size
+                        )
+                        if vwap_result.fully_filled:
+                            fill_price = vwap_result.vwap
+                        else:
+                            fill_price = vwap_result.vwap
+                    else:
+                        fill_price = best_bid
+
                     fill = Fill(
                         fill_id=f"paper_fill_{coid}_{int(time.time())}",
                         order_id=state.exchange_order_id or coid,
                         client_order_id=coid,
                         token_id=token_id,
                         side=OrderSide.SELL,
-                        price=best_bid,  # Fill at best bid
+                        price=fill_price,
                         size=state.intent.size,
                         fee=Decimal("0"),
                         timestamp=datetime.utcnow(),
@@ -366,6 +408,13 @@ class OrderManagementSystem:
                 state.updated_at = datetime.utcnow()
                 self._paper_fills.append(fill)
 
+                # Log slippage if we used VWAP
+                slippage = None
+                if full_orderbook:
+                    base_price = best_ask if fill.side == OrderSide.BUY else best_bid
+                    if base_price:
+                        slippage = abs(fill.price - base_price)
+
                 logger.info(
                     "oms_paper_fill",
                     client_order_id=coid,
@@ -373,10 +422,95 @@ class OrderManagementSystem:
                     side=fill.side.value,
                     price=str(fill.price),
                     size=str(fill.size),
+                    slippage=str(slippage) if slippage else None,
                 )
 
                 if self._on_fill:
                     self._on_fill(fill)
+
+    def check_execution_quality(
+        self,
+        intent: OrderIntent,
+        orderbook: OrderBook,
+    ) -> Dict[str, Any]:
+        """
+        Check execution quality for a proposed order.
+
+        Returns analysis including:
+        - Expected fill price (VWAP)
+        - Estimated slippage
+        - Whether execution is recommended
+        - Warnings about liquidity
+        """
+        return self._ob_analyzer.check_execution_quality(
+            orderbook=orderbook,
+            side=intent.side,
+            size=intent.size,
+            price=intent.price,
+        )
+
+    def estimate_fill_cost(
+        self,
+        intent: OrderIntent,
+        orderbook: OrderBook,
+    ) -> Dict[str, Decimal]:
+        """
+        Estimate total cost of executing an order.
+
+        Returns:
+        - notional: Base trade value
+        - slippage_cost: Cost due to slippage
+        - gas_cost: Network fees
+        - total_cost: All-in cost
+        """
+        return estimate_execution_cost(
+            orderbook=orderbook,
+            side=intent.side,
+            size=intent.size,
+        )
+
+    def get_optimal_size(
+        self,
+        orderbook: OrderBook,
+        side: OrderSide,
+        max_slippage_pct: Optional[Decimal] = None,
+    ) -> Decimal:
+        """
+        Get the optimal order size for a given slippage tolerance.
+
+        Returns the maximum size that can be executed within the slippage limit.
+        """
+        slippage = max_slippage_pct or self.max_slippage_pct
+        return self._ob_analyzer.get_max_size_for_slippage(
+            orderbook=orderbook,
+            side=side,
+            max_slippage_pct=slippage,
+        )
+
+    def analyze_liquidity(self, orderbook: OrderBook) -> Dict[str, Any]:
+        """
+        Analyze orderbook liquidity.
+
+        Returns snapshot of:
+        - Spread and spread percentage
+        - Depth at various price levels
+        - Order book imbalance
+        """
+        snapshot = self._ob_analyzer.analyze_liquidity(orderbook)
+        return {
+            "token_id": snapshot.token_id,
+            "best_bid": snapshot.best_bid,
+            "best_ask": snapshot.best_ask,
+            "spread": snapshot.spread,
+            "spread_pct": snapshot.spread_pct,
+            "bid_depth_10bps": snapshot.bid_depth_10bps,
+            "ask_depth_10bps": snapshot.ask_depth_10bps,
+            "bid_depth_50bps": snapshot.bid_depth_50bps,
+            "ask_depth_50bps": snapshot.ask_depth_50bps,
+            "total_bid_volume": snapshot.total_bid_volume,
+            "total_ask_volume": snapshot.total_ask_volume,
+            "imbalance": snapshot.imbalance,
+        }
 
     def get_open_orders(self) -> List[Order]:
         """Get all open orders."""
