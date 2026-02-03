@@ -211,17 +211,40 @@ class GammaClient:
 
     def _parse_market(self, data: Dict[str, Any]) -> Market:
         """Parse market data from API response."""
+        import json
+
         # Parse tokens
         tokens = []
         clob_token_ids = data.get("clobTokenIds", [])
-        outcomes = data.get("outcomes", "Yes,No").split(",")
+
+        # Handle case where clobTokenIds is a JSON string instead of a list
+        if isinstance(clob_token_ids, str):
+            try:
+                clob_token_ids = json.loads(clob_token_ids)
+            except json.JSONDecodeError:
+                clob_token_ids = []
+
+        # Parse outcomes - could be a string like "Yes,No" or a JSON string like '["Yes","No"]'
+        outcomes_raw = data.get("outcomes", "Yes,No")
+        if isinstance(outcomes_raw, str):
+            # Try parsing as JSON first
+            try:
+                outcomes = json.loads(outcomes_raw)
+            except json.JSONDecodeError:
+                # Fall back to comma-separated
+                outcomes = outcomes_raw.split(",")
+        elif isinstance(outcomes_raw, list):
+            outcomes = outcomes_raw
+        else:
+            outcomes = ["Yes", "No"]
 
         for i, token_id in enumerate(clob_token_ids):
             outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
+            outcome_str = outcome.strip() if isinstance(outcome, str) else str(outcome)
             tokens.append(Token(
                 token_id=token_id,
                 market_id=data.get("id", ""),
-                outcome=outcome.strip(),
+                outcome=outcome_str,
                 winner=None,
             ))
 
