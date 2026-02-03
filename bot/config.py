@@ -118,6 +118,26 @@ class Config:
         config.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         config.slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
 
+        # Load strategies from default strategies.yaml if it exists
+        strategies_path = Path("config/strategies.yaml")
+        if strategies_path.exists():
+            try:
+                with open(strategies_path) as f:
+                    strat_data = yaml.safe_load(f)
+                if strat_data and "strategies" in strat_data:
+                    config.strategies = [
+                        StrategyConfig(
+                            name=s["name"],
+                            enabled=s.get("enabled", True),
+                            params=s.get("params", {}),
+                            markets=s.get("markets", []),
+                            tokens=s.get("tokens", []),
+                        )
+                        for s in strat_data["strategies"]
+                    ]
+            except Exception:
+                pass  # Fall back to no strategies
+
         return config
 
     @classmethod
