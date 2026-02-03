@@ -12,7 +12,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set
 
-from strategies.base import StrategyBase, StrategyContext, register_strategy
+from strategies.base import StrategyBase, StrategyContext
+from strategies.loader import register_strategy
 from connectors.news_sources import (
     NewsAggregator,
     NewsEvent,
