@@ -52,7 +52,7 @@ def load_strategy(
         )
 
     strategy_cls = _STRATEGY_REGISTRY[name]
-    return strategy_cls(name=name, config=config)
+    return strategy_cls(name=name, params=config or {}, tokens=[])
 
 
 def load_strategies_from_config(
@@ -67,6 +67,7 @@ def load_strategies_from_config(
     Returns:
         List of instantiated strategy objects
     """
+    _ensure_builtins_loaded()
     strategies = []
 
     for cfg in strategy_configs:
@@ -75,8 +76,10 @@ def load_strategies_from_config(
 
         name = cfg["name"]
         params = cfg.get("params", {})
+        tokens = cfg.get("tokens", [])
 
-        strategy = load_strategy(name, config=params)
+        strategy_cls = _STRATEGY_REGISTRY[name]
+        strategy = strategy_cls(name=name, params=params, tokens=tokens)
         strategies.append(strategy)
 
     return strategies
