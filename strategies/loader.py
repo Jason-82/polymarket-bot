@@ -89,5 +89,6 @@ def _ensure_builtins_loaded() -> None:
         try:
             from strategies import market_maker  # noqa: F401
             from strategies import value_threshold  # noqa: F401
+            from strategies import news_alpha  # noqa: F401
         except ImportError:
             pass  # Strategies may not be implemented yet

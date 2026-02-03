@@ -78,9 +78,11 @@ class NewsAlphaConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "NewsAlphaConfig":
         """Create config from dictionary."""
+        import os
         return cls(
-            twitter_bearer_token=data.get("twitter_bearer_token"),
-            claude_api_key=data.get("claude_api_key"),
+            # Load API keys from config or fall back to environment variables
+            twitter_bearer_token=data.get("twitter_bearer_token") or os.environ.get("TWITTER_BEARER_TOKEN"),
+            claude_api_key=data.get("claude_api_key") or os.environ.get("ANTHROPIC_API_KEY"),
             enable_twitter=data.get("enable_twitter", True),
             enable_rss=data.get("enable_rss", True),
             twitter_poll_interval=data.get("twitter_poll_interval", 15),
