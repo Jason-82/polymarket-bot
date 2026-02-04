@@ -7,6 +7,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+
+# Load .env file before any config access
+load_dotenv()
+
 from bot.config import BotMode, Config
 from bot.engine import TradingEngine
 from monitoring.logger import setup_logging, get_logger
