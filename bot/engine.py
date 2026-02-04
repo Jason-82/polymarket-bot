@@ -123,6 +123,15 @@ class TradingEngine:
         )
         logger.info("engine_strategies_loaded", count=len(self.strategies))
 
+        # Start strategies
+        context = self._build_strategy_context()
+        for strategy in self.strategies:
+            try:
+                await strategy.start(context)
+                logger.info("engine_strategy_started", strategy=strategy.name)
+            except Exception as e:
+                logger.error("engine_strategy_start_failed", strategy=strategy.name, error=str(e))
+
         # Connect to WebSocket
         if self.state.active_token_ids:
             await self._connect_websocket()
@@ -151,6 +160,14 @@ class TradingEngine:
         logger.info("engine_stopping")
         self._running = False
         self._shutdown_event.set()
+
+        # Stop strategies
+        for strategy in self.strategies:
+            try:
+                await strategy.stop()
+                logger.info("engine_strategy_stopped", strategy=strategy.name)
+            except Exception as e:
+                logger.error("engine_strategy_stop_failed", strategy=strategy.name, error=str(e))
 
         # Cancel all orders if in trading mode
         if self.config.mode in (BotMode.PAPER, BotMode.LIVE):
@@ -360,6 +377,20 @@ class TradingEngine:
         """Reconcile positions from Data API."""
         # TODO: Implement position reconciliation
         pass
+
+    def _build_strategy_context(self) -> StrategyContext:
+        """Build context object to pass to strategies."""
+        return StrategyContext(
+            timestamp=datetime.utcnow(),
+            orderbooks=self.state.orderbooks.copy(),
+            market_metadata=self.state.markets.copy(),
+            token_to_market=self.state.token_to_market.copy(),
+            positions=self.state.positions.copy(),
+            open_orders=self.oms.get_open_orders(),
+            account_balance=self.state.balance,
+            mode=self.config.mode.value,
+            config={},
+        )
 
     def _on_kill_switch(self, state) -> None:
         """Handle kill switch activation."""
