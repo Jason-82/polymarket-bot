@@ -169,9 +169,26 @@ class NewsAlphaStrategy(StrategyBase):
         """Initialize and start the strategy."""
         logger.info("news_alpha_starting", config=self.config.__dict__)
 
+        # Convert Market objects to dicts for the mapper
+        market_dicts = [
+            {
+                "condition_id": m.condition_id,
+                "id": m.market_id,
+                "question": m.question or m.title,
+                "title": m.title,
+                "description": m.description,
+                "category": m.category,
+                "tokens": [
+                    {"token_id": t.token_id, "outcome": t.outcome}
+                    for t in m.tokens
+                ],
+            }
+            for m in context.market_metadata.values()
+        ]
+
         # Initialize market mapper
         self._mapper = MarketMapper()
-        self._mapper.update_markets(list(context.market_metadata.values()))
+        self._mapper.update_markets(market_dicts)
 
         # Initialize LLM analyzer
         if self.config.claude_api_key:
@@ -527,12 +544,7 @@ class NewsAlphaStrategy(StrategyBase):
         2. Cache all markets for cross-market analysis
         3. Convert pending signals to order intents
         """
-        # Update market metadata
-        if self._mapper:
-            self._mapper.update_markets(list(context.market_metadata.values()))
-
-        # Cache all markets for cross-market analysis
-        # Convert Market objects to dicts for the analyzer
+        # Convert Market objects to dicts for the mapper and cross-market analyzer
         self._all_markets = [
             {
                 "condition_id": m.condition_id,
@@ -548,6 +560,10 @@ class NewsAlphaStrategy(StrategyBase):
             }
             for m in context.market_metadata.values()
         ]
+
+        # Update market mapper with dict-formatted markets
+        if self._mapper:
+            self._mapper.update_markets(self._all_markets)
 
         # For now, signals are logged but not converted to intents
         # Full implementation would maintain a signal queue and convert here
