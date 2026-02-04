@@ -93,8 +93,8 @@ strategies:
       # claude_api_key: ${ANTHROPIC_API_KEY}
 
       # ----- News Sources -----
-      enable_twitter: true          # Real-time tweets from key accounts
-      enable_rss: true              # Backup from Reuters, AP, etc.
+      enable_twitter: false         # Disabled - requires paid Twitter API
+      enable_rss: true              # RSS feeds from Reuters, AP, CNBC, FT, etc.
       twitter_poll_interval: 15     # Seconds between Twitter checks
       rss_poll_interval: 60         # Seconds between RSS checks
 
