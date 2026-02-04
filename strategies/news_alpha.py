@@ -80,10 +80,17 @@ class NewsAlphaConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "NewsAlphaConfig":
         """Create config from dictionary."""
         import os
+        from dotenv import load_dotenv
+        # Ensure .env is loaded (may be redundant but guarantees env vars are available)
+        load_dotenv()
+
+        twitter_token = data.get("twitter_bearer_token") or os.environ.get("TWITTER_BEARER_TOKEN")
+        claude_key = data.get("claude_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+
         return cls(
             # Load API keys from config or fall back to environment variables
-            twitter_bearer_token=data.get("twitter_bearer_token") or os.environ.get("TWITTER_BEARER_TOKEN"),
-            claude_api_key=data.get("claude_api_key") or os.environ.get("ANTHROPIC_API_KEY"),
+            twitter_bearer_token=twitter_token,
+            claude_api_key=claude_key,
             enable_twitter=data.get("enable_twitter", True),
             enable_rss=data.get("enable_rss", True),
             twitter_poll_interval=data.get("twitter_poll_interval", 15),
