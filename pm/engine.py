@@ -37,7 +37,7 @@ class Engine:
         self.pf = Portfolio(cash=cfg.execution.paper_starting_cash_usd if self.mode is Mode.PAPER else ZERO)
         self.store = Store(cfg.db_path)
         self.venue: Venue = make_venue(cfg)
-        self.strategies: list[Strategy] = build_strategies(cfg.strategies)
+        self.strategies: list[Strategy] = build_strategies(cfg.strategies, self.venue.name)
         self.risk = RiskGate(cfg.risk, self.mode)
         self.exchange: Exchange = self.venue.make_exchange(self.mode, self.ms.market_for)
         self.oms = OMS(self.exchange, cfg.execution, self.store)

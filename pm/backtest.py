@@ -66,7 +66,7 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float) -> int:
         px = PaperExchange(ms.market_for, pf.cash)
         oms = OMS(px, cfg.execution, scratch)
         risk = RiskGate(cfg.risk, Mode.PAPER)
-        strategies = build_strategies(cfg.strategies)
+        strategies = build_strategies(cfg.strategies, cfg.venue)
 
         events: list[tuple[float, int, tuple]] = [(r[0], 0, r) for r in books] + [(r[0], 1, r) for r in trades]
         events.sort(key=lambda e: (e[0], e[1]))

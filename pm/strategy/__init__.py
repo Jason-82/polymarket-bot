@@ -31,7 +31,18 @@ def register(name: str):
     return deco
 
 
-def build_strategies(strategy_cfg: dict[str, dict[str, Any]]) -> list[Strategy]:
+def resolve_params(params: dict[str, Any], venue: str = "") -> dict[str, Any]:
+    """Apply `venue_overrides.<venue>` on top of the base params (venues differ in tick, spread, fees)."""
+    base = {k: v for k, v in (params or {}).items() if k != "venue_overrides"}
+    overrides = (params or {}).get("venue_overrides") or {}
+    key = (venue or "").lower().replace("-", "_")
+    for k, v in overrides.items():
+        if str(k).lower().replace("-", "_") == key and isinstance(v, dict):
+            base.update(v)
+    return base
+
+
+def build_strategies(strategy_cfg: dict[str, dict[str, Any]], venue: str = "") -> list[Strategy]:
     # Import for side effects (registration)
     from . import complete_set, favorite_yield, maker  # noqa: F401
 
@@ -42,5 +53,5 @@ def build_strategies(strategy_cfg: dict[str, dict[str, Any]]) -> list[Strategy]:
         cls = REGISTRY.get(name)
         if cls is None:
             raise ValueError(f"unknown strategy '{name}' (known: {sorted(REGISTRY)})")
-        out.append(cls(params))
+        out.append(cls(resolve_params(params, venue)))
     return out

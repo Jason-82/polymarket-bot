@@ -74,6 +74,13 @@ strategies:
     hold_within: 0.01             # keep an existing quote if the new target is within this (queue position)
     join_best: true               # if the book is tighter than half_spread, join the best price...
     min_half_spread: 0.01         # ...as long as it is still at least this far from fair
+    venue_overrides:
+      polymarket_us:              # ticks of 0.001 and one-tick books: the edge is rebate + rewards, not spread
+        half_spread: 0.01
+        min_half_spread: 0.0      # join the best price outright
+        min_book_spread: 0.0
+        min_depth_shares_at_touch: 20
+        quote_size_shares: 20
     rewards_first: true           # in incentivised markets, quote inside the qualifying spread at qualifying size
     reward_spread_buffer: 0.005   # stay this far inside the max qualifying spread
 

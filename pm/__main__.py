@@ -271,9 +271,19 @@ async def _scan_us(cfg: Config) -> int:
             end = m.end_date.strftime("%Y-%m-%d") if m.end_date else "?"
             print(f"{m.question[:64]:64} {b.best_bid!s:>5} {b.best_ask!s:>5} {b.spread!s:>5} "
                   f"{b.bid_size_at_touch!s:>7} {b.ask_size_at_touch!s:>7} {m.liquidity_usd:>9,.0f} {end:>10} {','.join(m.tags)[:30]}")
-        quotable = sum(1 for m in markets if (b := books.get(m.yes.token_id)) and b.spread and b.spread >= Decimal("0.02"))
-        print(f"\n{len(markets)} markets selected; {quotable} with spread >= 0.02; "
+        spreads = [b.spread for m in markets if (b := books.get(m.yes.token_id)) and b.spread is not None]
+        buckets = {"<=0.002": 0, "<=0.01": 0, "<=0.02": 0, ">0.02": 0}
+        for s in spreads:
+            k = "<=0.002" if s <= Decimal("0.002") else "<=0.01" if s <= Decimal("0.01") else "<=0.02" if s <= Decimal("0.02") else ">0.02"
+            buckets[k] += 1
+        tag_counts: dict[str, int] = {}
+        for m in markets:
+            for t in m.tags:
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+        top_tags = sorted(tag_counts.items(), key=lambda x: -x[1])[:12]
+        print(f"\n{len(markets)} markets selected; spreads {buckets}; "
               f"{sum(1 for m in markets if m.end_date)} with a known end date.")
+        print(f"tags: {top_tags}")
         return 0
     finally:
         await v.stop()

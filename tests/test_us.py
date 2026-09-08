@@ -20,16 +20,18 @@ ROW = {
     "active": True, "closed": False, "liquidity": 120000.0, "volume": 550000.0, "eventSlug": "fomc-sep",
 }
 # Shape observed from the real venue (probe 2026-09-08): no outcome/liquidity/volume, but quotes and fees.
-REAL_ROW = {
-    "slug": "paccc-usse-midterms-2026-11-03-rep", "title": "Republican Party", "outcomes": ["Yes", "No"],
-    "outcomePrices": ["0.62", "0.38"], "bestBidQuote": {"px": {"value": "0.61"}, "qty": "200"},
-    "bestAskQuote": {"px": {"value": "0.63"}, "qty": "150"}, "feeCoefficient": 0.06, "minimumTradeQty": 5,
-    "orderPriceMinTickSize": 0.01, "endDate": "2027-02-01T23:59:00Z", "status": "active", "active": True,
-    "closed": False, "hidden": False, "category": "Politics", "tags": [{"label": "Midterms"}],
-    "sportsMarketType": None, "gameStartTime": None, "subject": {"name": "Republican Party"},
+REAL_ROW = {   # verbatim shape from the venue, 2026-09-08 (JSON-string lists, Amount quotes, election "sports" type)
+    "slug": "paccc-usse-midterms-2026-11-03-rep", "title": "Republican Party", "outcomes": "[\"Yes\",\"No\"]",
+    "outcomePrices": "[\"0.5370\",\"0.464\"]", "bestBidQuote": {"value": "0.5360", "currency": "USD"},
+    "bestAskQuote": {"value": "0.5370", "currency": "USD"}, "status": "MARKET_STATUS_OPEN", "marketType": "election",
+    "category": "politics", "tags": [], "feeCoefficient": 0.06, "minimumTradeQty": 1, "orderPriceMinTickSize": 0.001,
+    "endDate": "2027-02-01T23:59:00Z", "sportsMarketType": "election", "gameStartTime": "2026-11-03T00:00:00Z",
+    "active": True, "closed": False, "hidden": False, "subject": {"name": "Republican Party"},
+    "question": "U.S Senate Midterm Winner",
 }
-REAL_EVENT = {"slug": "usse-midterms-2026-11-03", "title": "U.S Senate Midterm Winner", "category": "Politics",
-              "tags": [{"label": "Politics"}, {"label": "Midterms"}], "endDate": None, "teams": [], "seriesSlug": None}
+REAL_EVENT = {"slug": "usse-midterms-2026-11-03", "title": "U.S Senate Midterm Winner", "category": "politics",
+              "tags": [{"label": "Politics", "slug": "politics"}, {"label": "Midterms", "slug": "midterms"}],
+              "endDate": "2026-11-03T23:59:00Z", "teams": [], "seriesSlug": "us-midterms-2026"}
 BOOK = {
     "marketSlug": "fed-cut-sep", "state": "MARKET_STATE_OPEN",
     "bids": [{"px": {"value": "0.61", "currency": "USD"}, "qty": "500"}, {"px": {"value": "0.60", "currency": "USD"}, "qty": "900"}],
@@ -54,15 +56,37 @@ def test_market_mapping_and_fees():
 def test_real_venue_row_shape():
     m = market_from_us(REAL_ROW, REAL_EVENT)
     assert m.question == "U.S Senate Midterm Winner: Republican Party" and m.yes.outcome == "Yes"
-    assert m.end_date.year == 2027 and m.tick_size == D("0.01") and m.min_order_size == D(5)
+    assert m.end_date.isoformat().startswith("2026-11-03")        # earlier of market/event dates
+    assert m.tick_size == D("0.001") and m.min_order_size == D(1)
     assert m.fee_rate == D("0.06") and m.maker_rebate_rate == D("0.0125")
-    assert "politics" in m.tags and "midterms" in m.tags and "sports" not in m.tags
+    assert "politics" in m.tags and "midterms" in m.tags and "type:election" in m.tags
+    assert "sports" not in m.tags                                  # sportsMarketType="election" must NOT count
     assert m.accepting_orders
-    assert quote_hints(REAL_ROW) == (D("0.61"), D("0.63"))
-    # sports by sportsMarketType, zero-fee market gets zero rebate, hidden markets excluded
-    assert "sports" in market_from_us({**REAL_ROW, "sportsMarketType": "moneyline"}, REAL_EVENT).tags
+    assert quote_hints(REAL_ROW) == (D("0.5360"), D("0.5370"))
+    assert "sports" in market_from_us({**REAL_ROW, "marketType": "moneyline"}, REAL_EVENT).tags
+    assert "sports" in market_from_us(REAL_ROW, {**REAL_EVENT, "teams": [{"id": 1}]}).tags
+    assert "sports" in market_from_us(REAL_ROW, {**REAL_EVENT, "category": "sports"}).tags
     assert market_from_us({**REAL_ROW, "feeCoefficient": 0}, REAL_EVENT).maker_rebate_rate == 0
     assert market_from_us({**REAL_ROW, "hidden": True}, REAL_EVENT).accepting_orders is False
+
+
+def test_price_formatting_follows_tick():
+    from pm.venues.polymarket_us import format_price
+    assert format_price(D("0.536"), D("0.001")) == "0.536"
+    assert format_price(D("0.5"), D("0.001")) == "0.500"
+    assert format_price(D("0.53"), D("0.01")) == "0.53"
+    p = order_params(Intent("maker", "x|L", Side.BUY, D("0.536"), D(20)), tick=D("0.001"))
+    assert p["price"]["value"] == "0.536"
+
+
+def test_venue_overrides_apply_only_to_that_venue():
+    from pm.strategy import resolve_params
+    base = {"enabled": True, "half_spread": 0.02, "min_half_spread": 0.01,
+            "venue_overrides": {"polymarket_us": {"min_half_spread": 0.0, "quote_size_shares": 20}}}
+    us = resolve_params(base, "polymarket_us")
+    assert us["min_half_spread"] == 0.0 and us["quote_size_shares"] == 20 and us["half_spread"] == 0.02
+    intl = resolve_params(base, "polymarket")
+    assert intl["min_half_spread"] == 0.01 and "venue_overrides" not in intl
 
 
 def test_rest_book_unwraps_marketdata():
@@ -93,11 +117,11 @@ async def test_us_universe_prefilters_and_ranks_by_depth():
     cfg = Config()
     cfg.universe.max_markets = 2
     cfg.universe.min_liquidity_usd = D(0)
-    cfg.universe.max_days_to_resolution = 365      # the fixture market ends 2027-02-01
+    cfg.universe.max_days_to_resolution = 365      # fixture dates are fixed; keep the window wide
     deep = {**REAL_ROW, "slug": "deep"}
     thin = {**REAL_ROW, "slug": "thin"}
-    wide = {**REAL_ROW, "slug": "wide", "bestBidQuote": {"px": {"value": "0.30"}}, "bestAskQuote": {"px": {"value": "0.70"}}}
-    sport = {**REAL_ROW, "slug": "sport", "sportsMarketType": "spread"}
+    wide = {**REAL_ROW, "slug": "wide", "bestBidQuote": {"value": "0.30"}, "bestAskQuote": {"value": "0.70"}}
+    sport = {**REAL_ROW, "slug": "sport", "marketType": "moneyline"}
     books = {
         "deep": {"bids": [{"px": {"value": "0.61"}, "qty": "5000"}], "offers": [{"px": {"value": "0.63"}, "qty": "5000"}]},
         "thin": {"bids": [{"px": {"value": "0.61"}, "qty": "10"}], "offers": [{"px": {"value": "0.63"}, "qty": "10"}]},
@@ -175,6 +199,25 @@ def test_maker_join_best_on_tight_us_book():
     # target 0.625-0.02=0.605 -> 0.60; best bid 0.61 is better and fair-0.61=0.015 >= 0.01 -> join at 0.61
     assert yes.price == D("0.61")
     assert RiskGate(RiskConfig(), Mode.PAPER).evaluate(out, mk_ctx([m], [long_b, short_b]), True).accepted
+
+
+def test_maker_joins_one_tick_book_with_us_overrides():
+    """The real Senate book: tick 0.001, bid 0.536 x 460, ask 0.537 x 7429. With the US overrides the maker
+    joins the best bid on both sides instead of standing back for a spread that does not exist."""
+    m = market_from_us(REAL_ROW, REAL_EVENT)
+    book = {"bids": [{"px": {"value": "0.5360"}, "qty": "460"}, {"px": {"value": "0.5330"}, "qty": "232"}],
+            "offers": [{"px": {"value": "0.5370"}, "qty": "7429"}, {"px": {"value": "0.5380"}, "qty": "49"}]}
+    long_b, short_b = books_from_us(m.slug, book)
+    params = {"quote_size_shares": 20, "half_spread": 0.01, "min_book_spread": 0.0, "max_book_spread": 0.15,
+              "min_depth_shares_at_touch": 20, "price_band": [0.10, 0.90], "max_inventory_shares": 40,
+              "sell_inventory": False, "join_best": True, "min_half_spread": 0.0, "rewards_first": False}
+    out = Maker(params).on_tick(mk_ctx([m], [long_b, short_b]))
+    yes = next(i for i in out if i.token_id.endswith("|L"))
+    no = next(i for i in out if i.token_id.endswith("|S"))
+    assert yes.price == D("0.536") and no.price == D("0.463")       # join best on both sides
+    assert yes.price < long_b.best_ask and no.price < short_b.best_ask
+    rep = RiskGate(RiskConfig(), Mode.PAPER).evaluate(out, mk_ctx([m], [long_b, short_b]), True)
+    assert len(rep.accepted) == 2, rep.rejected
 
 
 def test_config_venue_and_us_secrets(tmp_path, monkeypatch):

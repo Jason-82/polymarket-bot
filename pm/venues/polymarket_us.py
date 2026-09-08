@@ -33,7 +33,7 @@ from ..execution import Exchange, ExchangeError, Recorder
 from ..execution.paper import PaperExchange
 from ..feed import Trade
 from ..fees import maker_rebate, taker_fee
-from ..gamma import VS_RE
+from ..gamma import SPORT_WORDS, VS_RE
 from ..log import get_logger
 from ..models import ONE, ZERO, D, Book, Fill, Intent, Level, Market, Mode, Order, OrderStatus, Side, TimeInForce, Token
 from ..universe import passes_filters
@@ -150,11 +150,16 @@ def market_from_us(row: dict[str, Any], event: Optional[dict[str, Any]] = None) 
         except ValueError:
             outcomes = None
     outcome = row.get("outcome") or (str(outcomes[0]) if isinstance(outcomes, list) and outcomes else "Yes")
-    end = None
+    # Market endDate is often a trading-close buffer months after the event; the event endDate is the
+    # resolution-relevant one. Use the earlier of the two.
+    dates = []
     for src in (row, ev):
         for k in ("endDate", "endTime", "closeTime", "closeDate", "expirationTime", "resolutionTime",
                   "settlementTime", "expiresAt", "endsAt"):
-            end = end or _dt(src.get(k))
+            d = _dt(src.get(k))
+            if d is not None:
+                dates.append(d)
+    end = min(dates) if dates else None
     tags: set[str] = set()
     for src in (row, ev):
         for k in ("category", "categories", "tags"):
@@ -162,10 +167,16 @@ def market_from_us(row: dict[str, Any], event: Optional[dict[str, Any]] = None) 
             for t in (v if isinstance(v, list) else [v]):
                 if t:
                     tags.add(str(t.get("label") if isinstance(t, dict) else t).lower())
+    mt = str(row.get("marketType") or "").lower()
+    if mt:
+        tags.add(f"type:{mt}")
     text = f"{label} {ev_title} {row.get('eventSlug', '')}"
-    if (row.get("team") or ev.get("teams") or ev.get("gameId") or row.get("gameId") or row.get("gameStartTime")
-            or row.get("sportsMarketType") or row.get("sportsMarketTypeV2") or ev.get("seriesSlug")
-            or VS_RE.search(text) or any("sport" in t for t in tags)):
+    # NOTE: sportsMarketType / gameStartTime are populated on non-sports markets too (e.g. "election"),
+    # so they are NOT used as sports signals.
+    sport_types = {"moneyline", "spread", "total", "totals", "over_under", "props", "player_prop", "parlay"}
+    if (row.get("team") or ev.get("teams") or ev.get("gameId") or row.get("gameId")
+            or mt in sport_types or VS_RE.search(text)
+            or any(t in SPORT_WORDS or "sport" in t for t in tags)):
         tags.add("sports")
     status = str(row.get("status") or row.get("state") or "").lower()
     closed_like = any(w in status for w in ("closed", "resolved", "settled", "halted", "suspended", "expired", "terminated"))
@@ -240,13 +251,20 @@ def trades_from_us(slug: str, payload: dict[str, Any]) -> list[Trade]:
     ]
 
 
-def order_params(intent: Intent) -> dict[str, Any]:
+def format_price(price: Decimal, tick: Decimal = US_TICK) -> str:
+    """Price string at the market's tick precision (ticks are 0.01 or 0.001 on this venue)."""
+    exp = tick.normalize().as_tuple().exponent
+    decimals = max(2, -exp) if isinstance(exp, int) else 2
+    return f"{price.quantize(Decimal(1).scaleb(-decimals)):.{decimals}f}"
+
+
+def order_params(intent: Intent, tick: Decimal = US_TICK) -> dict[str, Any]:
     slug, short = split_token(intent.token_id)
     params: dict[str, Any] = {
         "marketSlug": slug,
         "intent": INTENT[(short, intent.side)],
         "type": "ORDER_TYPE_LIMIT",
-        "price": {"value": f"{intent.price:.2f}", "currency": "USD"},
+        "price": {"value": format_price(intent.price, tick), "currency": "USD"},
         "quantity": int(intent.size),
         "tif": TIF[intent.tif],
         "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
@@ -460,7 +478,8 @@ class USExchange:
 
     # ---- exchange API
     async def place(self, intent: Intent) -> Order:
-        params = order_params(intent)
+        m = self._market_for(intent.token_id)
+        params = order_params(intent, m.tick_size if m else US_TICK)
         try:
             resp = await self._client.orders.create(params)
         except Exception as e:
