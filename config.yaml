@@ -1,0 +1,62 @@
+# pm configuration. Everything here is hot-editable between runs; secrets live in .env.
+
+mode: paper            # read_only | paper | live
+tick_seconds: 1.0      # strategy evaluation cadence
+db_path: data/pm.sqlite
+log_level: INFO
+
+universe:
+  refresh_seconds: 600
+  max_markets: 40               # how many markets to subscribe to
+  min_liquidity_usd: 5000
+  min_volume_24h_usd: 2000
+  min_days_to_resolution: 2
+  max_days_to_resolution: 120
+  exclude_tags: [sports]        # sports carries the highest taker fee and fastest tape
+  include_neg_risk: true
+  # Optional explicit list of condition IDs; when non-empty, filters above are ignored.
+  condition_ids: []
+
+risk:
+  max_notional_per_market_usd: 40
+  max_total_notional_usd: 200     # sum of |position cost| + resting order notional
+  max_open_orders: 30
+  daily_loss_limit_usd: 20        # realised + unrealised, resets at UTC midnight
+  min_cash_reserve_usd: 20
+  min_hours_to_resolution: 24     # no new maker orders inside this window
+  kill_switch_file: KILL          # create this file to cancel everything and halt
+  require_geoblock_ok_for_live: true
+
+execution:
+  requote_epsilon: 0.005          # don't replace a resting order for a smaller price move
+  min_seconds_between_requotes: 3
+  taker_retry_seconds: 5
+  paper_starting_cash_usd: 300
+  fill_poll_seconds: 2
+
+strategies:
+  complete_set:
+    enabled: true
+    margin: 0.01                  # require cost < 1 - margin after fees
+    max_legs_notional_usd: 30
+    taker: true                   # this strategy takes; fee is included in the math
+
+  maker:
+    enabled: true
+    quote_size_shares: 10
+    half_spread: 0.02             # distance from fair on each side (before tick rounding)
+    min_book_spread: 0.02         # don't quote into books already tighter than this
+    max_book_spread: 0.15         # don't quote into broken/illiquid books
+    min_depth_shares_at_touch: 50
+    price_band: [0.10, 0.90]      # only quote when mid is inside this band
+    max_inventory_shares: 40      # per token
+    inventory_skew_per_share: 0.0005
+    sell_inventory: true          # also post asks on tokens we hold (two-sided quote)
+    stale_after_seconds: 15
+
+  favorite_yield:
+    enabled: false
+    min_price: 0.95
+    max_days_to_resolution: 14
+    min_annualized_yield: 0.25
+    size_shares: 10

@@ -1,34 +1,7 @@
-# Polymarket Trading Bot - Dependencies
-
-# HTTP client
-httpx>=0.25.0
-
-# WebSocket client
-websockets>=12.0
-
-# Official Polymarket client
-py-clob-client>=0.15.0
-
-# Configuration
-pyyaml>=6.0
-python-dotenv>=1.0.0
-
-# Structured logging
-structlog>=23.2.0
-
-# Database (optional for PostgreSQL migration)
-# psycopg2-binary>=2.9.9  # Uncomment for PostgreSQL
-
-# Testing
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-pytest-cov>=4.1.0
-
-# Type checking
-mypy>=1.7.0
-
-# Linting
-ruff>=0.1.6
-
-# Development
-ipython>=8.18.0
+httpx>=0.27
+websockets>=12
+pyyaml>=6
+python-dotenv>=1.0
+py-clob-client-v2>=1.1.0
+pytest>=8
+pytest-asyncio>=0.23

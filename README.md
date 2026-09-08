@@ -1,185 +1,117 @@
-# Polymarket Trading Bot
+# pm — a maker-first Polymarket bot
 
-A modular, event-driven trading bot for Polymarket prediction markets with hot-swappable strategy plugins, strict risk controls, and paper trading capabilities.
+Built from first principles for a small account. Read [DESIGN.md](DESIGN.md)
+for the reasoning; the short version:
 
-## Features
+- Polymarket now charges **taker** fees and pays **makers** (zero fees,
+  rebates, liquidity rewards). So the bot rests orders; it only crosses the
+  spread when the payoff is arithmetic (YES + NO < $1).
+- Strategies are pure functions; the same code runs in paper, live and
+  backtest. Everything is recorded to SQLite so expectancy can be measured
+  instead of guessed.
+- Risk limits are in dollars and are enforced, not suggested.
 
-- **Market Data Ingestion**: Real-time orderbook updates via WebSocket with REST fallback
-- **Modular Strategy Plugins**: Hot-swappable strategies without code changes
-- **Strict Risk Controls**: Pre-trade validation, exposure limits, and circuit breakers
-- **Kill Switch**: Automatic and manual trading halt with full order cancellation
-- **Paper Trading**: Simulate execution against live orderbooks without real orders
-- **Backtesting**: Test strategies against historical data (coming soon)
-- **Monitoring**: Structured JSON logs, metrics, and alerts (Telegram/Slack)
-- **SQLite Storage**: Persist market data, decisions, and PnL for analysis
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.10+
-- VPN connection (if trading from a geo-restricted region)
-
-### Installation
+## Install (Windows / Git Bash shown; Linux and macOS are the same minus the path)
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd polymarket-bot
-
-# Create virtual environment
+git clone <repo> && cd polymarket-bot
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+source venv/Scripts/activate          # Windows Git Bash;  Linux/macOS: source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env                  # edit later; not needed for paper mode
 ```
 
-### Configuration
+Python 3.11+.
+
+## First run: three safe commands
 
 ```bash
-# Copy environment template
-cp .env.example .env
-
-# Edit .env with your settings (optional for READ_ONLY mode)
+python -m pm probe          # connectivity, geoblock status, fee info, a live order book, WebSocket check
+python -m pm scan           # universe + YES/NO ask sums after fees; shows any structural arb right now
+python -m pm run --mode read_only   # record the tape, run strategies "on paper only" (no simulated fills)
 ```
 
-### Running the Bot
+Then paper trade:
 
 ```bash
-# Check geoblock status first
-python -m bot.main --check-geoblock
-
-# Run demo (fetch markets, subscribe to WebSocket for 30s)
-python -m bot.main --demo
-
-# Run in READ_ONLY mode (safe - no trading)
-python -m bot.main --mode READ_ONLY
-
-# Run in PAPER mode (simulated trading)
-python -m bot.main --mode PAPER
-
-# Show current status
-python -m bot.main --status
-
-# List available markets
-python -m bot.main --list-markets
+python -m pm run --mode paper
+python -m pm status         # tape size, fills, rejections, latest equity
+python -m pm backtest --since-hours 24
 ```
 
-## Bot Modes
+Stop with `Ctrl+C`. Create a file named `KILL` in the working directory to
+cancel everything and halt without stopping the process; delete it to resume.
 
-| Mode | Description |
-|------|-------------|
-| `READ_ONLY` | Ingest market data and build datasets. No orders placed. **Default and safest mode.** |
-| `PAPER` | Simulate order execution against live orderbooks. Track PnL without real money. |
-| `LIVE` | Real order placement. **Only use after extensive paper trading!** |
+## Configuration
 
-## Important Compliance Notice
+`config.yaml` — mode, universe filters, dollar risk limits, execution
+throttles and strategy parameters (each has comments). `.env` — secrets only.
 
-This bot **respects Polymarket's geoblock restrictions**. If you are in a geo-restricted region:
-
-1. The bot will automatically detect this on startup
-2. LIVE mode will be disabled
-3. You can still use READ_ONLY and PAPER modes
-4. **Do not attempt to circumvent geo-restrictions**
-
-## Project Structure
-
-```
-polymarket-bot/
-├── bot/              # Core engine and CLI
-├── connectors/       # Polymarket API integrations
-├── strategies/       # Trading strategy plugins
-├── risk/             # Risk management
-├── execution/        # Order management system
-├── storage/          # Database and persistence
-├── backtest/         # Backtesting harness
-├── monitoring/       # Logging and alerts
-├── config/           # Configuration files
-└── tests/            # Test suite
-```
+Defaults are sized for a **$300 account**: $40 per market, $200 total,
+$20/day loss limit, 10-share quotes.
 
 ## Strategies
 
-Three strategies are included:
+| name | what it does | default |
+|---|---|---|
+| `complete_set` | Buys YES+NO (or every YES of a complete neg-risk event) when the asks plus taker fees sum below $1. | on |
+| `maker` | Rests bids on both YES and NO around fair value, inventory-skewed; posts asks on held inventory. Earns spread + liquidity rewards + maker rebates. | on |
+| `favorite_yield` | Bids on ≥0.95 outcomes near resolution when the annualised yield clears a threshold. | off |
 
-### News Alpha (AI-Powered News Trading)
-- **Real-time news monitoring** from Twitter and RSS feeds
-- **Claude AI reasoning** to analyze market impact of news
-- **Speed edge**: Reacts to news faster than human traders
-- **Second-order effects**: AI finds non-obvious connections (e.g., Venezuela → oil → inflation)
+Adding one: create `pm/strategy/<name>.py`, decorate the class with
+`@register("<name>")`, implement `on_tick(ctx) -> list[Intent]`, and add a
+block under `strategies:` in `config.yaml`.
 
-**Requirements:**
-- Twitter API Bearer Token (from developer.twitter.com)
-- Anthropic API Key (from console.anthropic.com)
+## How paper fills work (read this before trusting paper P&L)
 
-**Risk defaults (for ~$100k portfolio):**
-- $500 base bet, scaling to $2k on high-confidence signals
-- $5k max per market, $10k daily exposure cap
-- 75% minimum AI confidence to trade
+- Taker orders fill by walking the live book, with the venue fee applied.
+- Post-only orders that would cross are rejected, as on the venue.
+- Resting orders fill when a real trade prints at or through their price, or
+  the far side of the book moves through them. **Queue position is ignored**,
+  so paper is an upper bound on maker fills.
 
-### Market Maker
-- Quotes bid/ask around midpoint with configurable spread
-- Inventory skew to manage position risk
-- **Not profitable out of the box** - for experimentation only
+## Going live
 
-### Value Threshold
-- Trades when price deviates from fair value estimate
-- Requires you to provide fair value estimates
-- **Not profitable out of the box** - for experimentation only
+1. Fund a Polygon wallet with pUSD on Polymarket and note the address that
+   holds the collateral (`PM_FUNDER`) and its type (`PM_SIGNATURE_TYPE`:
+   0 = plain EOA, 1 = Polymarket proxy, 2 = Polymarket Gnosis safe).
+2. Put the signing key in `.env` as `PM_PRIVATE_KEY`. On first live start
+   the bot derives CLOB API credentials and prints them; paste them into
+   `.env` so it does not have to derive them again.
+3. Set `mode: live` in `config.yaml` **and** `LIVE_TRADING=yes` in `.env`.
+   Both are required.
+4. Start small: lower `max_total_notional_usd` and `max_notional_per_market_usd`
+   to a few dollars for the first session.
 
-### Adding Custom Strategies
+On start and stop the bot cancels **all** open orders for the account — it
+assumes it is the only thing trading from that wallet. `pm probe` reports
+geoblock status; order endpoints are IP-gated by Polymarket and jurisdiction
+is your responsibility.
 
-1. Create a new file in `strategies/`
-2. Inherit from `StrategyBase`
-3. Implement `on_tick()` and `get_risk_budget()`
-4. Register with `@register_strategy("my_strategy")`
-5. Add to `config/strategies.yaml`
+## Layout
 
-## Risk Management
-
-The bot includes multiple safety layers:
-
-- **Pre-trade checks**: Price bounds, tick size, size limits
-- **Exposure limits**: Per-market and total portfolio caps
-- **Circuit breakers**: Max daily loss, max drawdown
-- **Kill switch**: Automatic (on limits) or manual (file/env)
-
-When the kill switch triggers:
-1. All open orders are cancelled
-2. Trading loop halts
-3. Alerts are sent (if configured)
-
-## Development
-
-```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Type checking
-mypy .
-
-# Linting
-ruff check .
+```
+pm/
+  models.py      Book, Market, Intent, Order, Fill, Position (Decimal everywhere)
+  config.py      config.yaml + .env
+  fees.py        taker fee = shares × rate × (p(1−p))^e ; unknown rate → worst case
+  gamma.py       market discovery
+  clob.py        REST books / fee info / rewards ; geoblock
+  feed.py        WebSocket /ws/market → books + trades
+  universe.py    market selection; completes neg-risk events
+  state.py       MarketState, Portfolio, Context (what strategies see)
+  strategy/      complete_set, maker, favorite_yield
+  risk.py        dollar caps, daily loss, resolution window, kill switch
+  oms.py         diff desired intents vs open orders
+  execution/     Recorder (read_only), PaperExchange, LiveExchange (py-clob-client-v2)
+  store.py       SQLite tape
+  backtest.py    replay tape through the same paper stack
+  engine.py      the loop
+tests/           unit tests (no network)
 ```
 
-## Security
+## Tests
 
-- Never commit `.env` or private keys
-- Use a dedicated trading wallet with limited funds
-- Start with READ_ONLY mode to understand the system
-- Paper trade extensively before going live
-- Set conservative risk limits initially
-
-See [SECURITY.md](SECURITY.md) for detailed security guidelines.
-
-## Disclaimer
-
-This software is provided for educational and research purposes. Trading prediction markets involves significant risk. You can lose money. The authors are not responsible for any financial losses incurred while using this software.
-
-## License
-
-MIT License - see LICENSE file for details.
+```bash
+pytest -q
+```
