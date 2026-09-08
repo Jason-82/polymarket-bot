@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Optional
 
 from .clob import Clob
 from .config import UniverseConfig
@@ -24,18 +23,49 @@ class Universe:
     async def select(self) -> list[Market]:
         if self.cfg.condition_ids:
             markets = await self.gamma.markets_by_condition(self.cfg.condition_ids)
+            markets = await self._complete_neg_risk_events(markets)
         else:
-            candidates = await self.gamma.active_markets(limit=max(400, self.cfg.max_markets * 5))
-            markets = [m for m in candidates if self._passes(m)]
-            markets.sort(key=lambda m: m.volume_24h_usd, reverse=True)
-            markets = markets[: self.cfg.max_markets]
-
-        markets = await self._complete_neg_risk_events(markets)
+            markets = self._pick(await self.gamma.active_markets(limit=max(600, self.cfg.max_markets * 10)))
         markets = await self._enrich(markets)
-        log.info("universe_selected", markets=len(markets), tokens=sum(len(m.tokens) for m in markets))
+        groups = len({m.event_id for m in markets if m.neg_risk and m.event_id})
+        log.info("universe_selected", markets=len(markets), tokens=sum(len(m.tokens) for m in markets),
+                 neg_risk_events=groups)
         return markets
 
-    # ------------------------------------------------------------------ filters
+    # ------------------------------------------------------------------ selection
+    def _pick(self, all_markets: list[Market]) -> list[Market]:
+        """Walk markets by volume; neg-risk markets bring their whole event if it is small enough."""
+        by_event: dict[str, list[Market]] = {}
+        for m in all_markets:
+            if m.event_id and m.accepting_orders and m.is_binary:
+                by_event.setdefault(m.event_id, []).append(m)
+
+        selected: list[Market] = []
+        have: set[str] = set()
+        singleton_events: set[str] = set()
+        for m in all_markets:
+            if len(selected) >= self.cfg.max_markets:
+                break
+            if m.condition_id in have or not self._passes(m):
+                continue
+            group = [m]
+            if m.neg_risk and m.event_id:
+                ev = by_event.get(m.event_id, [])
+                if 2 <= len(ev) <= self.cfg.max_event_markets and len(selected) + len(ev) <= self.cfg.max_markets:
+                    group = ev
+                else:
+                    # Event too large to complete: take at most ONE market from it as a plain
+                    # binary (complete_set stays out of incomplete groups; the maker may quote it).
+                    # Without this cap a 30-candidate field would fill the whole universe.
+                    if m.event_id in singleton_events:
+                        continue
+                    singleton_events.add(m.event_id)
+            for x in group:
+                if x.condition_id not in have:
+                    selected.append(x)
+                    have.add(x.condition_id)
+        return selected
+
     def _passes(self, m: Market) -> bool:
         c = self.cfg
         if not m.is_binary or not m.accepting_orders:
@@ -44,7 +74,8 @@ class Universe:
             return False
         if m.liquidity_usd < c.min_liquidity_usd or m.volume_24h_usd < c.min_volume_24h_usd:
             return False
-        if any(t in m.tags for t in (x.lower() for x in c.exclude_tags)):
+        excluded = {x.lower() for x in c.exclude_tags}
+        if any(t in excluded for t in m.tags):
             return False
         if m.end_date is None:
             return False
@@ -56,7 +87,7 @@ class Universe:
         return True
 
     async def _complete_neg_risk_events(self, markets: list[Market]) -> list[Market]:
-        """For every neg-risk event we touch, hold all of its active markets so Σ YES is meaningful."""
+        """Explicit condition_ids path: pull the rest of any neg-risk event we were given."""
         have = {m.condition_id for m in markets}
         out = list(markets)
         for eid in sorted({m.event_id for m in markets if m.neg_risk and m.event_id}):
@@ -66,7 +97,6 @@ class Universe:
                 log.warning("event_fetch_failed", event=eid, error=str(e)[:200])
                 continue
             for m in ev_markets:
-                m.event_market_count = len(ev_markets)
                 if m.condition_id not in have:
                     out.append(m)
                     have.add(m.condition_id)

@@ -24,6 +24,7 @@ class UniverseConfig:
     max_days_to_resolution: float = 120
     exclude_tags: list[str] = field(default_factory=lambda: ["sports"])
     include_neg_risk: bool = True
+    max_event_markets: int = 12      # neg-risk events larger than this are not completed
     condition_ids: list[str] = field(default_factory=list)
 
 

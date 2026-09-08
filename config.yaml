@@ -12,8 +12,9 @@ universe:
   min_volume_24h_usd: 2000
   min_days_to_resolution: 2
   max_days_to_resolution: 120
-  exclude_tags: [sports]        # sports carries the highest taker fee and fastest tape
+  exclude_tags: [sports]        # sports/esports: highest taker fee, fastest tape; detected by tag or "X vs Y"
   include_neg_risk: true
+  max_event_markets: 12         # complete neg-risk events only up to this many candidates
   # Optional explicit list of condition IDs; when non-empty, filters above are ignored.
   condition_ids: []
 
