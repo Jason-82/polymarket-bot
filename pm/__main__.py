@@ -201,14 +201,22 @@ async def _probe_us(cfg: Config, slug: str | None, ws_seconds: float) -> int:
             print("Market .............. none")
             return 1
         full = (await v.public.markets.retrieve_by_slug(slug) or {}).get("market") or row
-        print(f"\nMarket: {full.get('title')} [{full.get('outcome')}]  slug={slug}")
-        print(f"  raw keys: {sorted(full.keys())}")
+        print(f"\nMarket: {full.get('title')}  slug={slug}")
+        keep = {k: full.get(k) for k in ("outcomes", "outcomePrices", "bestBidQuote", "bestAskQuote", "status",
+                                         "marketType", "category", "tags", "feeCoefficient", "minimumTradeQty",
+                                         "orderPriceMinTickSize", "endDate", "sportsMarketType", "gameStartTime",
+                                         "marketSides", "subject", "question", "titleShort")}
+        print(f"  raw values: {json.dumps(keep, default=str)[:1500]}")
+        ev_keep = {k: ev.get(k) for k in ("category", "tags", "endDate", "seriesSlug", "teams", "marketCounts", "period")}
+        print(f"  event values: {json.dumps(ev_keep, default=str)[:600]}")
         m = market_from_us(full, ev)
-        print(f"  mapped: end={m.end_date} tags={m.tags} liquidity=${m.liquidity_usd:,.0f} volume=${m.volume_24h_usd:,.0f} "
-              f"accepting={m.accepting_orders} fee_rate={m.fee_rate} rebate={m.maker_rebate_rate}")
+        print(f"  mapped: question={m.question!r} outcome={m.yes.outcome} end={m.end_date} tags={m.tags} "
+              f"tick={m.tick_size} min_qty={m.min_order_size} accepting={m.accepting_orders} "
+              f"fee_rate={m.fee_rate} rebate={m.maker_rebate_rate}")
 
         data = await v.public.markets.book(slug)
-        print(f"  book keys: {sorted((data or {}).keys())}  state={(data or {}).get('state')}")
+        inner = (data or {}).get("marketData") if isinstance((data or {}).get("marketData"), dict) else (data or {})
+        print(f"  book keys: {sorted((data or {}).keys())} inner={sorted(inner.keys())} state={inner.get('state')}")
         long_b, short_b = books_from_us(slug, data or {})
         for name, b in (("LONG " + str(m.yes.outcome), long_b), ("SHORT (mirrored)", short_b)):
             print(f"\n  [{name}] bid={b.best_bid} ask={b.best_ask} spread={b.spread}")

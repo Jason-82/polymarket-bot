@@ -93,13 +93,63 @@ def _dt(v: Any) -> Optional[datetime]:
         return None
 
 
+def _quote_px(v: Any) -> Optional[Decimal]:
+    """bestBidQuote / bestAskQuote / outcomePrices entries come in several shapes; extract a price."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, dict):
+        for k in ("px", "price", "value"):
+            if v.get(k) is not None:
+                return _quote_px(v[k])
+        return None
+    if isinstance(v, (list, tuple)):
+        return _quote_px(v[0]) if v else None
+    try:
+        p = D(v)
+    except Exception:
+        return None
+    if p > ONE and p <= 100:      # cents
+        p = p / 100
+    return p if ZERO < p < ONE else None
+
+
+def quote_hints(row: dict[str, Any]) -> tuple[Optional[Decimal], Optional[Decimal]]:
+    """(best_bid, best_ask) for the long side from the listing row, if the venue provides them."""
+    bid = _quote_px(row.get("bestBidQuote"))
+    ask = _quote_px(row.get("bestAskQuote"))
+    if bid is None and ask is None:
+        prices = row.get("outcomePrices")
+        if isinstance(prices, str):
+            try:
+                import json
+                prices = json.loads(prices)
+            except ValueError:
+                prices = None
+        if isinstance(prices, list) and prices:
+            p = _quote_px(prices[0])
+            if p is not None:
+                bid = ask = p
+    return bid, ask
+
+
 def market_from_us(row: dict[str, Any], event: Optional[dict[str, Any]] = None) -> Optional[Market]:
     slug = row.get("slug")
     if not slug:
         return None
     ev = event or {}
-    title = row.get("title") or ev.get("title") or slug
-    outcome = row.get("outcome") or "Yes"
+    ev_title = ev.get("title") or ""
+    sub = row.get("subject") or {}
+    sub_name = sub.get("name") if isinstance(sub, dict) else None
+    label = row.get("title") or row.get("question") or sub_name or slug
+    question = f"{ev_title}: {label}" if ev_title and label and label != ev_title else (label or ev_title)
+    outcomes = row.get("outcomes")
+    if isinstance(outcomes, str):
+        try:
+            import json
+            outcomes = json.loads(outcomes)
+        except ValueError:
+            outcomes = None
+    outcome = row.get("outcome") or (str(outcomes[0]) if isinstance(outcomes, list) and outcomes else "Yes")
     end = None
     for src in (row, ev):
         for k in ("endDate", "endTime", "closeTime", "closeDate", "expirationTime", "resolutionTime",
@@ -112,38 +162,48 @@ def market_from_us(row: dict[str, Any], event: Optional[dict[str, Any]] = None) 
             for t in (v if isinstance(v, list) else [v]):
                 if t:
                     tags.add(str(t.get("label") if isinstance(t, dict) else t).lower())
-    text = f"{title} {ev.get('title', '')} {row.get('eventSlug', '')}"
-    if row.get("team") or ev.get("team") or ev.get("gameId") or row.get("gameId") or VS_RE.search(text) \
-            or any("sport" in t for t in tags):
+    text = f"{label} {ev_title} {row.get('eventSlug', '')}"
+    if (row.get("team") or ev.get("teams") or ev.get("gameId") or row.get("gameId") or row.get("gameStartTime")
+            or row.get("sportsMarketType") or row.get("sportsMarketTypeV2") or ev.get("seriesSlug")
+            or VS_RE.search(text) or any("sport" in t for t in tags)):
         tags.add("sports")
-    state = str(row.get("state") or "")
+    status = str(row.get("status") or row.get("state") or "").lower()
+    closed_like = any(w in status for w in ("closed", "resolved", "settled", "halted", "suspended", "expired", "terminated"))
+    fee_coef = row.get("feeCoefficient")
+    fee_rate = D(fee_coef) if fee_coef is not None else US_TAKER_RATE
+    # The published rebate is exchange-wide (0.0125 against a 0.06 taker rate); scale it if a market's
+    # coefficient differs so a zero-fee market does not pretend to pay a rebate.
+    rebate = (US_MAKER_REBATE * fee_rate / US_TAKER_RATE) if US_TAKER_RATE > ZERO else ZERO
+    tick = D(row.get("orderPriceMinTickSize") or US_TICK)
     long_id, short_id = token_ids(slug)
     return Market(
         condition_id=slug,
-        question=f"{title} [{outcome}]",
+        question=question,
         slug=slug,
         tokens=[Token(long_id, outcome), Token(short_id, f"NOT {outcome}")],
         neg_risk=False,
         event_id=str(row.get("eventSlug") or ev.get("slug") or ""),
         event_slug=str(row.get("eventSlug") or ev.get("slug") or ""),
-        tick_size=US_TICK,
-        min_order_size=Decimal("1"),
-        fee_rate=US_TAKER_RATE,
+        tick_size=tick if ZERO < tick < ONE else US_TICK,
+        min_order_size=D(row.get("minimumTradeQty") or 1),
+        fee_rate=fee_rate,
         fee_exponent=ONE,
         fee_known=True,
-        maker_rebate_rate=US_MAKER_REBATE,
+        maker_rebate_rate=rebate,
         end_date=end,
-        liquidity_usd=D(row.get("liquidity") or 0),
+        liquidity_usd=D(row.get("liquidity") or row.get("liquidityNum") or 0),
         volume_24h_usd=D(row.get("volume24h") or row.get("volume24hr") or row.get("volume") or 0),
         tags=sorted(tags),
         accepting_orders=bool(row.get("active", True)) and not bool(row.get("closed", False))
-        and state in OPEN_MARKET_STATES,
+        and not bool(row.get("hidden", False)) and not bool(row.get("archived", False)) and not closed_like,
     )
 
 
 def books_from_us(slug: str, data: dict[str, Any], ts: Optional[float] = None) -> tuple[Book, Book]:
     """Long book from the venue payload, plus the mirrored short book."""
     ts = ts or time.time()
+    if isinstance(data.get("marketData"), dict):      # REST wraps the payload; the WebSocket does not
+        data = data["marketData"]
     bids = [Level(_amount(l.get("px")), D(l.get("qty"))) for l in data.get("bids") or []]
     offers = [Level(_amount(l.get("px")), D(l.get("qty") or l.get("quantity"))) for l in data.get("offers") or data.get("asks") or []]
     long_id, short_id = token_ids(slug)
@@ -625,22 +685,53 @@ class PolymarketUSVenue:
             offset += page
         return out[:limit]
 
-    async def all_markets(self, limit_events: int = 300) -> list[Market]:
-        markets: list[Market] = []
+    async def all_markets(self, limit_events: int = 300) -> list[tuple[Market, Optional[Decimal], Optional[Decimal]]]:
+        """(market, hinted best bid, hinted best ask) in event order, which is the venue's volume order."""
+        out: list[tuple[Market, Optional[Decimal], Optional[Decimal]]] = []
         for ev in await self.list_events_raw(limit_events):
             for row in ev.get("markets") or []:
                 m = market_from_us(row, ev)
                 if m and m.accepting_orders:
-                    markets.append(m)
-        markets.sort(key=lambda m: (m.volume_24h_usd, m.liquidity_usd), reverse=True)
-        return markets
+                    bid, ask = quote_hints(row)
+                    out.append((m, bid, ask))
+        return out
 
     async def select_universe(self) -> list[Market]:
+        """The venue lists no volume/liquidity per market, so:
+        1. filter on tags / end date and on the listing's quoted spread and price band,
+        2. fetch real books for the first max_book_candidates survivors (event order ≈ volume order),
+        3. rank by dollar depth at the touch and keep max_markets.
+        """
         c = self.cfg.universe
-        markets = await self.all_markets(limit_events=max(200, c.max_markets * 5))
-        selected = [m for m in markets if passes_filters(m, c, require_end_date=False)][: c.max_markets]
-        log.info("us_universe_selected", candidates=len(markets), markets=len(selected),
-                 with_end_date=sum(1 for m in selected if m.end_date))
+        u = self.cfg.venue_us
+        rows = await self.all_markets(limit_events=max(200, c.max_markets * 5))
+        pre: list[Market] = []
+        for m, bid, ask in rows:
+            if not passes_filters(m, c, require_end_date=False, require_liquidity=False):
+                continue
+            if bid is not None and ask is not None:
+                mid, spread = (bid + ask) / 2, ask - bid
+                if spread > u.prefilter_max_spread or not (u.prefilter_band[0] <= mid <= u.prefilter_band[1]):
+                    continue
+            pre.append(m)
+            if len(pre) >= u.max_book_candidates:
+                break
+
+        books = await self.seed_books([m.yes.token_id for m in pre])
+        ranked: list[tuple[Decimal, Market]] = []
+        for m in pre:
+            b = books.get(m.yes.token_id)
+            if not b or b.best_bid is None or b.best_ask is None:
+                continue
+            depth = b.bid_size_at_touch * b.best_bid + b.ask_size_at_touch * (ONE - b.best_ask)
+            m.liquidity_usd = depth
+            if c.min_liquidity_usd > 0 and depth < c.min_liquidity_usd:
+                continue
+            ranked.append((depth, m))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        selected = [m for _, m in ranked[: c.max_markets]]
+        log.info("us_universe_selected", listed=len(rows), prefiltered=len(pre), with_books=len(ranked),
+                 markets=len(selected), with_end_date=sum(1 for m in selected if m.end_date))
         return selected
 
     async def seed_books(self, token_ids_: list[str]) -> dict[str, Book]:

@@ -10,7 +10,8 @@ from pm.risk import RiskGate
 from pm.state import Portfolio
 from pm.strategy.maker import Maker
 from pm.venues.polymarket_us import (
-    books_from_us, market_from_us, order_params, positions_from_us, split_token, token_ids, trades_from_us,
+    books_from_us, market_from_us, order_params, positions_from_us, quote_hints, split_token, token_ids,
+    trades_from_us,
 )
 from tests.conftest import D, mk_ctx
 
@@ -18,6 +19,17 @@ ROW = {
     "id": 7, "slug": "fed-cut-sep", "title": "Fed cuts rates in September?", "outcome": "Yes",
     "active": True, "closed": False, "liquidity": 120000.0, "volume": 550000.0, "eventSlug": "fomc-sep",
 }
+# Shape observed from the real venue (probe 2026-09-08): no outcome/liquidity/volume, but quotes and fees.
+REAL_ROW = {
+    "slug": "paccc-usse-midterms-2026-11-03-rep", "title": "Republican Party", "outcomes": ["Yes", "No"],
+    "outcomePrices": ["0.62", "0.38"], "bestBidQuote": {"px": {"value": "0.61"}, "qty": "200"},
+    "bestAskQuote": {"px": {"value": "0.63"}, "qty": "150"}, "feeCoefficient": 0.06, "minimumTradeQty": 5,
+    "orderPriceMinTickSize": 0.01, "endDate": "2027-02-01T23:59:00Z", "status": "active", "active": True,
+    "closed": False, "hidden": False, "category": "Politics", "tags": [{"label": "Midterms"}],
+    "sportsMarketType": None, "gameStartTime": None, "subject": {"name": "Republican Party"},
+}
+REAL_EVENT = {"slug": "usse-midterms-2026-11-03", "title": "U.S Senate Midterm Winner", "category": "Politics",
+              "tags": [{"label": "Politics"}, {"label": "Midterms"}], "endDate": None, "teams": [], "seriesSlug": None}
 BOOK = {
     "marketSlug": "fed-cut-sep", "state": "MARKET_STATE_OPEN",
     "bids": [{"px": {"value": "0.61", "currency": "USD"}, "qty": "500"}, {"px": {"value": "0.60", "currency": "USD"}, "qty": "900"}],
@@ -36,7 +48,66 @@ def test_market_mapping_and_fees():
     assert maker_rebate(D("0.5"), D(100), m) == D("0.3125")
     sport = market_from_us({**ROW, "slug": "nyk-bos", "title": "Knicks vs Celtics", "team": {"id": 1}})
     assert "sports" in sport.tags
-    assert market_from_us({**ROW, "state": "MARKET_STATE_HALTED"}).accepting_orders is False
+    assert market_from_us({**ROW, "status": "MARKET_STATE_HALTED"}).accepting_orders is False
+
+
+def test_real_venue_row_shape():
+    m = market_from_us(REAL_ROW, REAL_EVENT)
+    assert m.question == "U.S Senate Midterm Winner: Republican Party" and m.yes.outcome == "Yes"
+    assert m.end_date.year == 2027 and m.tick_size == D("0.01") and m.min_order_size == D(5)
+    assert m.fee_rate == D("0.06") and m.maker_rebate_rate == D("0.0125")
+    assert "politics" in m.tags and "midterms" in m.tags and "sports" not in m.tags
+    assert m.accepting_orders
+    assert quote_hints(REAL_ROW) == (D("0.61"), D("0.63"))
+    # sports by sportsMarketType, zero-fee market gets zero rebate, hidden markets excluded
+    assert "sports" in market_from_us({**REAL_ROW, "sportsMarketType": "moneyline"}, REAL_EVENT).tags
+    assert market_from_us({**REAL_ROW, "feeCoefficient": 0}, REAL_EVENT).maker_rebate_rate == 0
+    assert market_from_us({**REAL_ROW, "hidden": True}, REAL_EVENT).accepting_orders is False
+
+
+def test_rest_book_unwraps_marketdata():
+    long_b, _ = books_from_us("fed-cut-sep", {"marketData": BOOK})
+    assert long_b.best_bid == D("0.61") and long_b.best_ask == D("0.64")
+
+
+class _Public:
+    """Fake AsyncPolymarketUS exposing just what select_universe uses."""
+
+    def __init__(self, events, books):
+        self._events, self._books = events, books
+        self.events = self
+        self.markets = self
+
+    async def list(self, params):                       # events.list
+        return {"events": self._events if params.get("offset", 0) == 0 else []}
+
+    async def book(self, slug):                          # markets.book
+        return {"marketData": self._books[slug]}
+
+    async def close(self):
+        return None
+
+
+async def test_us_universe_prefilters_and_ranks_by_depth():
+    from pm.venues.polymarket_us import PolymarketUSVenue
+    cfg = Config()
+    cfg.universe.max_markets = 2
+    cfg.universe.min_liquidity_usd = D(0)
+    cfg.universe.max_days_to_resolution = 365      # the fixture market ends 2027-02-01
+    deep = {**REAL_ROW, "slug": "deep"}
+    thin = {**REAL_ROW, "slug": "thin"}
+    wide = {**REAL_ROW, "slug": "wide", "bestBidQuote": {"px": {"value": "0.30"}}, "bestAskQuote": {"px": {"value": "0.70"}}}
+    sport = {**REAL_ROW, "slug": "sport", "sportsMarketType": "spread"}
+    books = {
+        "deep": {"bids": [{"px": {"value": "0.61"}, "qty": "5000"}], "offers": [{"px": {"value": "0.63"}, "qty": "5000"}]},
+        "thin": {"bids": [{"px": {"value": "0.61"}, "qty": "10"}], "offers": [{"px": {"value": "0.63"}, "qty": "10"}]},
+    }
+    v = PolymarketUSVenue.__new__(PolymarketUSVenue)
+    v.cfg, v.data, v._exchange = cfg, None, None
+    v.public = _Public([{**REAL_EVENT, "markets": [thin, sport, wide, deep]}], books)
+    out = await v.select_universe()
+    assert [m.condition_id for m in out] == ["deep", "thin"]        # wide (prefilter) and sport (tag) dropped
+    assert out[0].liquidity_usd > out[1].liquidity_usd
 
 
 def test_books_mirror_and_split():

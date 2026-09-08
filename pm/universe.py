@@ -14,13 +14,13 @@ from .models import Market, utcnow
 log = get_logger(__name__)
 
 
-def passes_filters(m: Market, c: UniverseConfig, require_end_date: bool = True) -> bool:
+def passes_filters(m: Market, c: UniverseConfig, require_end_date: bool = True, require_liquidity: bool = True) -> bool:
     """Venue-independent universe filters."""
     if not m.is_binary or not m.accepting_orders:
         return False
     if m.neg_risk and not c.include_neg_risk:
         return False
-    if m.liquidity_usd < c.min_liquidity_usd or m.volume_24h_usd < c.min_volume_24h_usd:
+    if require_liquidity and (m.liquidity_usd < c.min_liquidity_usd or m.volume_24h_usd < c.min_volume_24h_usd):
         return False
     if c.prefer_rewards and c.min_reward_rate_per_day > 0 and m.reward_rate_per_day < c.min_reward_rate_per_day:
         return False

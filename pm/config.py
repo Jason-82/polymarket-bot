@@ -60,6 +60,9 @@ class VenueUSConfig:
     ws_url: str = "wss://api.polymarket.us"
     ws_max_markets: int = 10          # the venue caps streaming; the rest are REST-polled
     book_poll_seconds: float = 5.0
+    max_book_candidates: int = 120    # how many pre-filtered markets to fetch books for when selecting
+    prefilter_max_spread: Decimal = Decimal("0.15")
+    prefilter_band: list = field(default_factory=lambda: [Decimal("0.05"), Decimal("0.95")])
 
 
 @dataclass
@@ -164,5 +167,7 @@ def _build(cls, data: dict[str, Any]):
             v = int(v)
         elif isinstance(current, float):
             v = float(v)
+        elif isinstance(current, list) and current and isinstance(current[0], Decimal) and isinstance(v, list):
+            v = [D(x) for x in v]
         setattr(obj, k, v)
     return obj
