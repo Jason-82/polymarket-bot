@@ -183,6 +183,9 @@ class LiveExchange:
         raw = resp.get("balance") if isinstance(resp, dict) else None
         return (D(raw) / Decimal(10 ** 6)) if raw is not None else None
 
+    async def positions(self) -> Optional[dict[str, tuple[Decimal, Decimal]]]:
+        return None  # not reconciled from the venue on CLOB; fills are the source of truth
+
     # ------------------------------------------------------------------ internals
     async def _poll(self) -> None:
         async with self._lock:

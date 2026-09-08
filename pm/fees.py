@@ -32,3 +32,10 @@ def taker_fee(price: Decimal, shares: Decimal, market: Market) -> Decimal:
 def effective_taker_price(price: Decimal, market: Market) -> Decimal:
     """Price per share including the fee, for a BUY."""
     return D(price) + taker_fee(price, ONE, market)
+
+
+def maker_rebate(price: Decimal, shares: Decimal, market: Market) -> Decimal:
+    """Rebate paid to the maker on a fill (positive number; callers negate it into Fill.fee)."""
+    if market.maker_rebate_rate <= ZERO:
+        return ZERO
+    return taker_fee_per_share(price, market.maker_rebate_rate, ONE) * shares

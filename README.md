@@ -62,6 +62,30 @@ Adding one: create `pm/strategy/<name>.py`, decorate the class with
 `@register("<name>")`, implement `on_tick(ctx) -> list[Intent]`, and add a
 block under `strategies:` in `config.yaml`.
 
+## Venues
+
+The engine is venue-agnostic. Set `venue:` in `config.yaml` or pass `--venue`.
+
+| venue | access | fees (per contract) | maker programs |
+|---|---|---|---|
+| `polymarket` | international CLOB V2, pUSD on Polygon, IP-gated | taker `rate × p(1−p)` by category (0 to 0.07); maker 0 | liquidity rewards + rebate share of taker fees |
+| `polymarket_us` | CFTC-regulated, USD, KYC, Ed25519 API keys | taker `0.06 × p(1−p)`; **maker rebate `0.0125 × p(1−p)` paid on every fill** | liquidity rewards scored by ticks from best price |
+
+On Polymarket US each market is one contract with a unified book. The bot
+maps it to a YES token (`<slug>|L`) and a synthetic NO token (`<slug>|S`)
+whose book is the mirror of the long book, so every strategy runs unchanged.
+A NO bid is sent as `BUY_SHORT`; the venue nets long and short into cash.
+
+```bash
+python -m pm --venue us probe          # schema, book, balances, order previews (nothing placed), WebSocket
+python -m pm --venue us scan           # selected universe with spreads and depth
+python -m pm --venue us run --mode paper
+```
+
+Keys come from `polymarket.us/developer` and go in `.env` as `PM_US_KEY_ID`
+and `PM_US_SECRET_KEY`. The venue caps streaming subscriptions
+(`venue_us.ws_max_markets`); other markets are REST-polled.
+
 ## Measuring whether it works: markouts
 
 `python -m pm status` prints, per strategy and per token, three numbers in

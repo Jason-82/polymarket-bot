@@ -192,6 +192,7 @@ class Market:
     fee_rate: Decimal = ZERO          # taker fee rate r  (fee = shares * r * (p(1-p))^e)
     fee_exponent: Decimal = ONE
     fee_known: bool = False
+    maker_rebate_rate: Decimal = ZERO # maker rebate per fill (Polymarket US: 0.0125 * p(1-p) per contract)
     end_date: Optional[datetime] = None
     liquidity_usd: Decimal = ZERO
     volume_24h_usd: Decimal = ZERO

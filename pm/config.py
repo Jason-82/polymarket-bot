@@ -54,6 +54,15 @@ class ExecutionConfig:
 
 
 @dataclass
+class VenueUSConfig:
+    gateway_url: str = "https://gateway.polymarket.us"
+    api_url: str = "https://api.polymarket.us"
+    ws_url: str = "wss://api.polymarket.us"
+    ws_max_markets: int = 10          # the venue caps streaming; the rest are REST-polled
+    book_poll_seconds: float = 5.0
+
+
+@dataclass
 class AlertsConfig:
     feed_down_seconds: float = 60.0
     on_fills: bool = True
@@ -71,12 +80,16 @@ class Secrets:
     live_trading_ack: bool = False
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    us_key_id: str = ""
+    us_secret_key: str = ""
 
     @classmethod
     def from_env(cls) -> "Secrets":
         return cls(
             telegram_bot_token=os.environ.get("PM_TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.environ.get("PM_TELEGRAM_CHAT_ID", "").strip(),
+            us_key_id=os.environ.get("PM_US_KEY_ID", "").strip(),
+            us_secret_key=os.environ.get("PM_US_SECRET_KEY", "").strip(),
             private_key=os.environ.get("PM_PRIVATE_KEY", "").strip(),
             funder=os.environ.get("PM_FUNDER", "").strip(),
             signature_type=int(os.environ.get("PM_SIGNATURE_TYPE", "0") or 0),
@@ -89,6 +102,7 @@ class Secrets:
 
 @dataclass
 class Config:
+    venue: str = "polymarket"      # polymarket | polymarket_us
     mode: Mode = Mode.PAPER
     tick_seconds: float = 1.0
     db_path: str = "data/pm.sqlite"
@@ -97,6 +111,7 @@ class Config:
     risk: RiskConfig = field(default_factory=RiskConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
+    venue_us: VenueUSConfig = field(default_factory=VenueUSConfig)
     strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
     secrets: Secrets = field(default_factory=Secrets)
 
@@ -116,6 +131,7 @@ class Config:
         if p.exists():
             raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         cfg = cls()
+        cfg.venue = str(raw.get("venue", cfg.venue)).lower()
         cfg.mode = Mode(str(raw.get("mode", cfg.mode.value)).lower())
         cfg.tick_seconds = float(raw.get("tick_seconds", cfg.tick_seconds))
         cfg.db_path = str(raw.get("db_path", cfg.db_path))
@@ -124,6 +140,7 @@ class Config:
         cfg.risk = _build(RiskConfig, raw.get("risk") or {})
         cfg.execution = _build(ExecutionConfig, raw.get("execution") or {})
         cfg.alerts = _build(AlertsConfig, raw.get("alerts") or {})
+        cfg.venue_us = _build(VenueUSConfig, raw.get("venue_us") or {})
         cfg.strategies = dict(raw.get("strategies") or {})
         cfg.secrets = Secrets.from_env()
         return cfg

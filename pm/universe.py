@@ -14,6 +14,29 @@ from .models import Market, utcnow
 log = get_logger(__name__)
 
 
+def passes_filters(m: Market, c: UniverseConfig, require_end_date: bool = True) -> bool:
+    """Venue-independent universe filters."""
+    if not m.is_binary or not m.accepting_orders:
+        return False
+    if m.neg_risk and not c.include_neg_risk:
+        return False
+    if m.liquidity_usd < c.min_liquidity_usd or m.volume_24h_usd < c.min_volume_24h_usd:
+        return False
+    if c.prefer_rewards and c.min_reward_rate_per_day > 0 and m.reward_rate_per_day < c.min_reward_rate_per_day:
+        return False
+    excluded = {x.lower() for x in c.exclude_tags}
+    if any(t in excluded for t in m.tags):
+        return False
+    if m.end_date is None:
+        return not require_end_date
+    now = utcnow()
+    if m.end_date < now + timedelta(days=c.min_days_to_resolution):
+        return False
+    if m.end_date > now + timedelta(days=c.max_days_to_resolution):
+        return False
+    return True
+
+
 class Universe:
     def __init__(self, gamma: Gamma, clob: Clob, cfg: UniverseConfig):
         self.gamma = gamma
@@ -93,26 +116,7 @@ class Universe:
         return selected
 
     def _passes(self, m: Market) -> bool:
-        c = self.cfg
-        if not m.is_binary or not m.accepting_orders:
-            return False
-        if m.neg_risk and not c.include_neg_risk:
-            return False
-        if m.liquidity_usd < c.min_liquidity_usd or m.volume_24h_usd < c.min_volume_24h_usd:
-            return False
-        if c.prefer_rewards and c.min_reward_rate_per_day > 0 and m.reward_rate_per_day < c.min_reward_rate_per_day:
-            return False
-        excluded = {x.lower() for x in c.exclude_tags}
-        if any(t in excluded for t in m.tags):
-            return False
-        if m.end_date is None:
-            return False
-        now = utcnow()
-        if m.end_date < now + timedelta(days=c.min_days_to_resolution):
-            return False
-        if m.end_date > now + timedelta(days=c.max_days_to_resolution):
-            return False
-        return True
+        return passes_filters(m, self.cfg, require_end_date=True)
 
     async def _complete_neg_risk_events(self, markets: list[Market]) -> list[Market]:
         """Explicit condition_ids path: pull the rest of any neg-risk event we were given."""

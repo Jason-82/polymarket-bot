@@ -21,6 +21,8 @@ class Exchange(Protocol):
     async def open_orders(self) -> list[Order]: ...
     async def drain_fills(self) -> list[Fill]: ...
     async def balance(self) -> Optional[Decimal]: ...
+    async def positions(self) -> Optional[dict[str, tuple[Decimal, Decimal]]]: ...
+    """{token_id: (shares, cost)} as the venue sees them, or None if the backend cannot say."""
 
 
 class Recorder:
@@ -48,4 +50,7 @@ class Recorder:
         return []
 
     async def balance(self) -> Optional[Decimal]:
+        return None
+
+    async def positions(self) -> Optional[dict[str, tuple[Decimal, Decimal]]]:
         return None

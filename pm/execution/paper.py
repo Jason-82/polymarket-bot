@@ -18,7 +18,7 @@ from decimal import Decimal
 from typing import Callable, Optional
 
 from ..feed import Trade
-from ..fees import taker_fee
+from ..fees import maker_rebate, taker_fee
 from ..log import get_logger
 from ..models import ZERO, Book, Fill, Intent, Market, Order, OrderStatus, Side, TimeInForce
 from . import ExchangeError
@@ -128,6 +128,9 @@ class PaperExchange:
     async def balance(self) -> Optional[Decimal]:
         return None  # the portfolio tracks paper cash itself
 
+    async def positions(self) -> Optional[dict[str, tuple[Decimal, Decimal]]]:
+        return None
+
     # ------------------------------------------------------------------ internals
     @staticmethod
     def _crosses(intent: Intent, book: Optional[Book]) -> bool:
@@ -160,8 +163,10 @@ class PaperExchange:
         if o.remaining <= ZERO:
             o.status = OrderStatus.FILLED
             self._orders.pop(o.order_id, None)
+        m = self._market_for(o.token_id)
+        rebate = maker_rebate(price, qty, m) if m else ZERO
         self._fills.append(Fill(
             order_id=o.order_id, tag=o.tag, strategy=o.strategy, token_id=o.token_id,
-            side=o.side, price=price, size=qty, fee=ZERO, maker=True, ts=time.time(),
+            side=o.side, price=price, size=qty, fee=-rebate, maker=True, ts=time.time(),
         ))
         log.info("paper_maker_fill", tag=o.tag, side=o.side.value, size=str(qty), price=str(price))

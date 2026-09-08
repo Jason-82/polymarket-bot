@@ -50,6 +50,8 @@ class Maker:
         self.hold_within = D(params.get("hold_within", "0.01"))
         self.rewards_first = bool(params.get("rewards_first", True))
         self.reward_spread_buffer = D(params.get("reward_spread_buffer", "0.005"))
+        self.join_best = bool(params.get("join_best", False))
+        self.min_half_spread = D(params.get("min_half_spread", "0.01"))
 
     def on_tick(self, ctx: Context) -> list[Intent]:
         out: list[Intent] = []
@@ -83,6 +85,7 @@ class Maker:
         size_y = self._scaled_size(base_size, net)
         if size_y >= m.min_order_size:
             px = self._bid_px(fair_adj - hs, by, m)
+            px = self._maybe_join(px, fair_adj, by, m)
             if px is not None:
                 px = self._hold(open_by_tag, m.yes.token_id, Side.BUY, px, by, m)
                 intents.append(self._intent(m.yes.token_id, Side.BUY, px, size_y, note))
@@ -91,6 +94,7 @@ class Maker:
         size_n = self._scaled_size(base_size, -net)
         if size_n >= m.min_order_size:
             px = self._bid_px((ONE - fair_adj) - hs, bn, m)
+            px = self._maybe_join(px, ONE - fair_adj, bn, m)
             if px is not None:
                 px = self._hold(open_by_tag, m.no.token_id, Side.BUY, px, bn, m)
                 intents.append(self._intent(m.no.token_id, Side.BUY, px, size_n, note))
@@ -123,13 +127,26 @@ class Maker:
                 size = m.reward_min_size
         return hs, size
 
+    def _maybe_join(self, px: Optional[Decimal], fair: Decimal, b: Book, m: Market) -> Optional[Decimal]:
+        """If the best bid is better than our target, join it when it still leaves min_half_spread of edge.
+
+        Venues that score liquidity rewards by ticks from the best price pay for being AT the best.
+        """
+        if not self.join_best or px is None or b.best_bid is None:
+            return px
+        if b.best_bid > px and fair - b.best_bid >= self.min_half_spread:
+            return b.best_bid
+        return px
+
     def _usable(self, b: Optional[Book], now_ts: float) -> bool:
         if b is None or b.mid is None:
             return False
         if b.age(now_ts) > self.stale_after:
             return False
         sp = b.spread
-        if sp is None or sp < self.min_book_spread or sp > self.max_book_spread:
+        if sp is None or sp > self.max_book_spread:
+            return False
+        if sp < self.min_book_spread and not self.join_best:
             return False
         if b.bid_size_at_touch < self.min_depth or b.ask_size_at_touch < self.min_depth:
             return False

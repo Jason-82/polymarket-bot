@@ -1,34 +1,32 @@
-"""The loop. One state, one tick, one execution path."""
+"""The loop. One state, one tick, one execution path; the venue is pluggable."""
 
 from __future__ import annotations
 
 import asyncio
 import time
-from decimal import Decimal
 from typing import Optional
 
 from .alerts import Alerts
-from .clob import Clob, Geoblock
 from .config import Config
-from .execution import Exchange, Recorder
+from .execution import Exchange
 from .execution.paper import PaperExchange
-from .feed import MarketFeed, Trade, UserFeed
-from .gamma import Gamma
+from .feed import Trade
 from .log import get_logger
-from .models import ZERO, Book, Mode
+from .models import ZERO, Book, Mode, Position
 from .oms import OMS
 from .risk import RiskGate
 from .state import MarketState, Portfolio, build_context
 from .store import Store
 from .strategy import Strategy, build_strategies
-from .universe import Universe
+from .venues import Venue, make_venue
 
 log = get_logger(__name__)
 
-GEOBLOCK_INTERVAL = 300
+ACCESS_INTERVAL = 300
 EQUITY_INTERVAL = 10
 STATS_INTERVAL = 60
 BALANCE_INTERVAL = 30
+POSITIONS_INTERVAL = 60
 
 
 class Engine:
@@ -38,17 +36,12 @@ class Engine:
         self.ms = MarketState()
         self.pf = Portfolio(cash=cfg.execution.paper_starting_cash_usd if self.mode is Mode.PAPER else ZERO)
         self.store = Store(cfg.db_path)
-        self.gamma = Gamma(cfg.gamma_url)
-        self.clob = Clob(cfg.clob_url)
-        self.geo = Geoblock(cfg.geoblock_url)
-        self.universe = Universe(self.gamma, self.clob, cfg.universe)
-        self.feed = MarketFeed(cfg.ws_url, self._on_book, self._on_trade)
+        self.venue: Venue = make_venue(cfg)
         self.strategies: list[Strategy] = build_strategies(cfg.strategies)
         self.risk = RiskGate(cfg.risk, self.mode)
-        self.exchange: Exchange = self._make_exchange()
+        self.exchange: Exchange = self.venue.make_exchange(self.mode, self.ms.market_for)
         self.oms = OMS(self.exchange, cfg.execution, self.store)
         self.alerts = Alerts(cfg.secrets.telegram_bot_token, cfg.secrets.telegram_chat_id)
-        self.user_feed: Optional[UserFeed] = None
         self._stop = asyncio.Event()
         self._halted = False
         self._feed_down_since: Optional[float] = None
@@ -56,14 +49,6 @@ class Engine:
         self._loss_halt_alerted = False
         self._last_heartbeat = time.time()
         self.ticks = 0
-
-    def _make_exchange(self) -> Exchange:
-        if self.mode is Mode.PAPER:
-            return PaperExchange(self.ms.market_for, self.cfg.execution.paper_starting_cash_usd)
-        if self.mode is Mode.LIVE:
-            from .execution.live import LiveExchange
-            return LiveExchange(self.cfg, self.ms.market_for)
-        return Recorder()
 
     # ------------------------------------------------------------------ feed callbacks
     def _on_book(self, book: Book) -> None:
@@ -80,7 +65,8 @@ class Engine:
 
     # ------------------------------------------------------------------ lifecycle
     async def run(self) -> None:
-        log.info("engine_starting", mode=self.mode.value, strategies=[s.name for s in self.strategies])
+        log.info("engine_starting", venue=self.venue.name, mode=self.mode.value,
+                 strategies=[s.name for s in self.strategies])
         try:
             await self._startup()
             await self._loop()
@@ -91,25 +77,23 @@ class Engine:
         self._stop.set()
 
     async def _startup(self) -> None:
-        await self._check_geoblock()
+        await self._check_access()
         await self._refresh_universe()
         await self._seed_books()
-        self.feed.start(self.ms.token_ids)
+        self.venue.start_feed(self.ms.token_ids, self._on_book, self._on_trade)
         await self.exchange.start()
+        await self.venue.after_exchange_start(self.exchange)
         if self.mode is Mode.LIVE:
             bal = await self.exchange.balance()
             if bal is not None:
                 self.pf.cash = bal
-            key, secret, passphrase = self.exchange.creds
-            if key:
-                self.user_feed = UserFeed(self.cfg.ws_user_url, key, secret, passphrase,
-                                          self.exchange.on_user_order, self.exchange.on_user_trade)
-                self.user_feed.start()
+            await self._sync_positions()
         self.pf.roll_day(self.ms.books)
-        self.store.event("start", f"mode={self.mode.value} markets={len(self.ms.markets)}")
-        log.info("engine_started", mode=self.mode.value, markets=len(self.ms.markets), tokens=len(self.ms.token_ids),
-                 cash=str(self.pf.cash), alerts=self.alerts.enabled)
-        self.alerts.fire(f"pm started: mode={self.mode.value} markets={len(self.ms.markets)} cash={self.pf.cash:.2f}")
+        self.store.event("start", f"venue={self.venue.name} mode={self.mode.value} markets={len(self.ms.markets)}")
+        log.info("engine_started", venue=self.venue.name, mode=self.mode.value, markets=len(self.ms.markets),
+                 tokens=len(self.ms.token_ids), cash=str(self.pf.cash), alerts=self.alerts.enabled)
+        self.alerts.fire(f"pm started: venue={self.venue.name} mode={self.mode.value} "
+                         f"markets={len(self.ms.markets)} cash={self.pf.cash:.2f}")
 
     async def _shutdown(self) -> None:
         log.info("engine_stopping")
@@ -118,13 +102,9 @@ class Engine:
                 await self.oms.cancel_all()
                 await self.exchange.stop()
         finally:
-            await self.feed.stop()
-            if self.user_feed is not None:
-                await self.user_feed.stop()
+            await self.venue.stop()
             self.store.event("stop", f"ticks={self.ticks}")
             self.store.close()
-            await self.gamma.aclose()
-            await self.clob.aclose()
             await self.alerts.send(f"pm stopped: ticks={self.ticks} equity={self.pf.equity(self.ms.books):.2f}")
             await self.alerts.aclose()
         log.info("engine_stopped", ticks=self.ticks)
@@ -132,9 +112,10 @@ class Engine:
     # ------------------------------------------------------------------ health
     def _check_health(self, now: float) -> None:
         a = self.cfg.alerts
-        if self.mode is Mode.LIVE and self.user_feed is not None:
-            self.exchange.user_feed_ok = self.user_feed.connected
-        if self.feed.connected or not self.ms.token_ids:
+        pfc = self.venue.private_feed_connected
+        if pfc is not None and hasattr(self.exchange, "user_feed_ok"):
+            self.exchange.user_feed_ok = pfc
+        if self.venue.feed_connected or not self.ms.token_ids:
             if self._feed_down_alerted:
                 self.alerts.fire("pm: market feed reconnected", key="feed_up")
             self._feed_down_since, self._feed_down_alerted = None, False
@@ -148,28 +129,32 @@ class Engine:
             self._last_heartbeat = now
             self.alerts.fire(
                 f"pm alive: ticks={self.ticks} equity={self.pf.equity(self.ms.books):.2f} "
-                f"day_pnl={self.pf.day_pnl(self.ms.books):.2f} placed={self.oms.placed} fills_today=?",
+                f"day_pnl={self.pf.day_pnl(self.ms.books):.2f} placed={self.oms.placed}",
                 key="heartbeat",
             )
 
     # ------------------------------------------------------------------ loop
     async def _loop(self) -> None:
-        last_geo = last_universe = last_equity = last_stats = last_balance = time.time()
+        now = time.time()
+        last_access = last_universe = last_equity = last_stats = last_balance = last_positions = now
         while not self._stop.is_set():
             t0 = time.time()
             try:
-                if t0 - last_geo > GEOBLOCK_INTERVAL:
-                    await self._check_geoblock()
-                    last_geo = t0
+                if t0 - last_access > ACCESS_INTERVAL:
+                    await self._check_access()
+                    last_access = t0
                 if t0 - last_universe > self.cfg.universe.refresh_seconds:
                     await self._refresh_universe()
-                    await self.feed.set_tokens(self.ms.token_ids)
+                    await self.venue.set_feed_tokens(self.ms.token_ids)
                     last_universe = t0
                 if self.mode is Mode.LIVE and t0 - last_balance > BALANCE_INTERVAL:
                     bal = await self.exchange.balance()
                     if bal is not None:
                         self.pf.cash = bal
                     last_balance = t0
+                if self.mode is Mode.LIVE and t0 - last_positions > POSITIONS_INTERVAL:
+                    await self._sync_positions()
+                    last_positions = t0
 
                 await self._tick()
                 self._check_health(t0)
@@ -213,11 +198,11 @@ class Engine:
         # Fills first, so strategies see current inventory.
         for f in await self.oms.drain_fills():
             self.pf.apply_fill(f)
-            log.info("fill", strategy=f.strategy, side=f.side.value, token=f.token_id[:10], size=str(f.size),
+            log.info("fill", strategy=f.strategy, side=f.side.value, token=f.token_id[:24], size=str(f.size),
                      price=str(f.price), fee=str(f.fee), maker=f.maker)
             if self.cfg.alerts.on_fills:
                 m = self.ms.market_for(f.token_id)
-                q = (m.question[:50] if m else f.token_id[:10])
+                q = (m.question[:50] if m else f.token_id[:24])
                 self.alerts.fire(f"fill {f.strategy} {f.side.value} {f.size}@{f.price} {q}", key=f"fill:{f.order_id}")
 
         day_pnl = self.pf.day_pnl(self.ms.books)
@@ -256,18 +241,18 @@ class Engine:
         await self.oms.sync(rep.accepted)
 
     # ------------------------------------------------------------------ helpers
-    async def _check_geoblock(self) -> None:
+    async def _check_access(self) -> None:
         try:
-            ok, country = await self.geo.check()
-            self.ms.geoblock_ok, self.ms.geoblock_country = ok, country
-            log.info("geoblock", allowed=ok, country=country)
+            ok, detail = await self.venue.check_access()
+            self.ms.geoblock_ok, self.ms.geoblock_country = ok, detail
+            log.info("access", allowed=ok, detail=detail)
         except Exception as e:
             self.ms.geoblock_ok = False
-            log.warning("geoblock_check_failed", error=str(e)[:200])
+            log.warning("access_check_failed", error=str(e)[:200])
 
     async def _refresh_universe(self) -> None:
         try:
-            markets = await self.universe.select()
+            markets = await self.venue.select_universe()
         except Exception as e:
             log.error("universe_refresh_failed", error=str(e)[:200])
             return
@@ -279,15 +264,29 @@ class Engine:
             self.store.market(m)
 
     async def _seed_books(self) -> None:
-        """REST snapshot so strategies have books before the WebSocket delivers."""
+        """REST snapshot so strategies have books before the feed delivers."""
         try:
-            books = await self.clob.books(self.ms.token_ids)
+            books = await self.venue.seed_books(self.ms.token_ids)
         except Exception as e:
             log.warning("seed_books_failed", error=str(e)[:200])
             return
         for b in books.values():
             self._on_book(b)
         log.info("books_seeded", count=len(books))
+
+    async def _sync_positions(self) -> None:
+        """Replace local positions with the venue's view when the backend can provide it."""
+        try:
+            venue_pos = await self.exchange.positions()
+        except Exception as e:
+            log.warning("positions_sync_failed", error=str(e)[:200])
+            return
+        if venue_pos is None:
+            return
+        self.pf.positions = {
+            tid: Position(tid, shares=shares, cost=cost) for tid, (shares, cost) in venue_pos.items() if shares > ZERO
+        }
+        log.info("positions_synced", count=len(self.pf.positions))
 
     def _snapshot_equity(self) -> None:
         eq = self.pf.equity(self.ms.books)
@@ -300,10 +299,10 @@ class Engine:
     def _log_stats(self) -> None:
         fresh = sum(1 for b in self.ms.books.values() if b.age() < 30)
         log.info(
-            "stats", ticks=self.ticks, feed=self.feed.connected, msgs=self.feed.messages,
-            books=len(self.ms.books), fresh=fresh, cash=f"{self.pf.cash:.2f}",
+            "stats", venue=self.venue.name, ticks=self.ticks, feed=self.venue.feed_connected,
+            msgs=self.venue.feed_messages, books=len(self.ms.books), fresh=fresh, cash=f"{self.pf.cash:.2f}",
             equity=f"{self.pf.equity(self.ms.books):.2f}", realised=f"{self.pf.realised_pnl:.2f}",
             fees=f"{self.pf.fees_paid:.2f}", placed=self.oms.placed, cancelled=self.oms.cancelled,
             rejected=self.oms.rejected, positions=sum(1 for p in self.pf.positions.values() if p.shares > ZERO),
-            geo=self.ms.geoblock_country,
+            access=self.ms.geoblock_country[:40],
         )

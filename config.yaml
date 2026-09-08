@@ -1,6 +1,11 @@
 # pm configuration. Everything here is hot-editable between runs; secrets live in .env.
 
+venue: polymarket      # polymarket (international CLOB) | polymarket_us (CFTC-regulated, USD)
 mode: paper            # read_only | paper | live
+
+venue_us:
+  ws_max_markets: 10   # the US venue caps streaming subscriptions; other markets are REST-polled
+  book_poll_seconds: 5
 tick_seconds: 1.0      # strategy evaluation cadence
 db_path: data/pm.sqlite
 log_level: INFO
@@ -64,6 +69,8 @@ strategies:
     sell_inventory: true          # also post asks on tokens we hold (two-sided quote)
     stale_after_seconds: 15
     hold_within: 0.01             # keep an existing quote if the new target is within this (queue position)
+    join_best: true               # if the book is tighter than half_spread, join the best price...
+    min_half_spread: 0.01         # ...as long as it is still at least this far from fair
     rewards_first: true           # in incentivised markets, quote inside the qualifying spread at qualifying size
     reward_spread_buffer: 0.005   # stay this far inside the max qualifying spread
 

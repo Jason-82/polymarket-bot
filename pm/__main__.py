@@ -26,11 +26,12 @@ log = get_logger("pm")
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="pm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", default="config.yaml")
+    p.add_argument("--venue", choices=["polymarket", "us"], help="override venue from config.yaml")
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("probe")
-    sp.add_argument("--condition-id", help="market to inspect (default: top-volume market)")
+    sp.add_argument("--condition-id", help="market to inspect (default: top-volume market); US: market slug")
     sp.add_argument("--ws-seconds", type=float, default=6.0)
 
     sub.add_parser("scan")
@@ -47,14 +48,21 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
     cfg = Config.load(args.config)
+    if args.venue:
+        cfg.venue = "polymarket_us" if args.venue == "us" else "polymarket"
     if args.cmd == "run" and args.mode:
         cfg.mode = Mode(args.mode)
     setup(cfg.log_level)
+    is_us = cfg.venue.replace("-", "_") in ("us", "polymarket_us", "polymarketus")
 
     try:
         if args.cmd == "probe":
+            if is_us:
+                return asyncio.run(_probe_us(cfg, args.condition_id, args.ws_seconds))
             return asyncio.run(_probe(cfg, args.condition_id, args.ws_seconds))
         if args.cmd == "scan":
+            if is_us:
+                return asyncio.run(_scan_us(cfg))
             return asyncio.run(_scan(cfg))
         if args.cmd == "run":
             return _run(cfg)
@@ -163,12 +171,114 @@ async def _scan(cfg: Config) -> int:
         await gamma.aclose()
 
 
+async def _probe_us(cfg: Config, slug: str | None, ws_seconds: float) -> int:
+    """Read-only look at the Polymarket US venue. Prints raw field names so we can verify the schema."""
+    from .venues.polymarket_us import PolymarketUSVenue, books_from_us, market_from_us
+
+    v = PolymarketUSVenue(cfg)
+    try:
+        ok, detail = await v.check_access()
+        print(f"Access .............. {'OK' if ok else 'FAILED'} ({detail})")
+
+        events = await v.list_events_raw(limit=3)
+        if not events:
+            print("Events .............. none returned")
+            return 1
+        ev = events[0]
+        print(f"Events .............. OK (top event: {ev.get('title')!r}, keys={sorted(ev.keys())})")
+        mk_rows = ev.get("markets") or []
+        print(f"  nested market keys: {sorted(mk_rows[0].keys()) if mk_rows else 'none'}")
+        print(f"  endTime={ev.get('endTime')} tags={[t.get('label') for t in ev.get('tags') or []]} "
+              f"series={(ev.get('series') or {}).get('slug')}")
+
+        if slug:
+            resp = await v.public.markets.retrieve_by_slug(slug)
+            row = (resp or {}).get("market") or {}
+        else:
+            row = mk_rows[0] if mk_rows else {}
+            slug = row.get("slug")
+        if not slug:
+            print("Market .............. none")
+            return 1
+        full = (await v.public.markets.retrieve_by_slug(slug) or {}).get("market") or row
+        print(f"\nMarket: {full.get('title')} [{full.get('outcome')}]  slug={slug}")
+        print(f"  raw keys: {sorted(full.keys())}")
+        m = market_from_us(full, ev)
+        print(f"  mapped: end={m.end_date} tags={m.tags} liquidity=${m.liquidity_usd:,.0f} volume=${m.volume_24h_usd:,.0f} "
+              f"accepting={m.accepting_orders} fee_rate={m.fee_rate} rebate={m.maker_rebate_rate}")
+
+        data = await v.public.markets.book(slug)
+        print(f"  book keys: {sorted((data or {}).keys())}  state={(data or {}).get('state')}")
+        long_b, short_b = books_from_us(slug, data or {})
+        for name, b in (("LONG " + str(m.yes.outcome), long_b), ("SHORT (mirrored)", short_b)):
+            print(f"\n  [{name}] bid={b.best_bid} ask={b.best_ask} spread={b.spread}")
+            for lvl in reversed(b.asks[:5]):
+                print(f"      ask {lvl.price}  x {lvl.size}")
+            for lvl in b.bids[:5]:
+                print(f"      bid {lvl.price}  x {lvl.size}")
+
+        s = cfg.secrets
+        if s.us_key_id and s.us_secret_key:
+            try:
+                bal = await v.public.account.balances()
+                print(f"\nBalances ............ {bal}")
+            except Exception as e:
+                print(f"\nBalances ............ failed: {str(e)[:200]}")
+            # Order preview is read-only: nothing is placed. It tells us how the venue interprets prices.
+            for intent in ("ORDER_INTENT_BUY_LONG", "ORDER_INTENT_BUY_SHORT"):
+                req = {"marketSlug": slug, "intent": intent, "type": "ORDER_TYPE_LIMIT",
+                       "price": {"value": "0.02", "currency": "USD"}, "quantity": 1,
+                       "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL", "participateDontInitiate": True}
+                try:
+                    pv = await v.public.orders.preview({"request": req})
+                    print(f"Preview {intent[13:]:10} -> {pv}")
+                except Exception as e:
+                    print(f"Preview {intent[13:]:10} -> failed: {str(e)[:200]}")
+
+            counts = {"book": 0, "trade": 0}
+            v.start_feed([m.yes.token_id], lambda b: counts.__setitem__("book", counts["book"] + 1),
+                         lambda t: counts.__setitem__("trade", counts["trade"] + 1))
+            await asyncio.sleep(ws_seconds)
+            print(f"\nMarket data ......... ws_connected={v.data.connected} messages={v.data.messages} "
+                  f"book_updates={counts['book']} trades={counts['trade']} in {ws_seconds:.0f}s")
+        else:
+            print("\nNo PM_US_KEY_ID / PM_US_SECRET_KEY in .env: skipped balances, preview and WebSocket.")
+        return 0
+    finally:
+        await v.stop()
+
+
+async def _scan_us(cfg: Config) -> int:
+    from .venues.polymarket_us import PolymarketUSVenue
+
+    v = PolymarketUSVenue(cfg)
+    try:
+        markets = await v.select_universe()
+        books = await v.seed_books([t.token_id for m in markets for t in m.tokens])
+        print(f"\n{'market':64} {'bid':>5} {'ask':>5} {'spr':>5} {'bidsz':>7} {'asksz':>7} {'liq$':>9} {'end':>10} tags")
+        for m in markets:
+            b = books.get(m.yes.token_id)
+            if not b:
+                continue
+            end = m.end_date.strftime("%Y-%m-%d") if m.end_date else "?"
+            print(f"{m.question[:64]:64} {b.best_bid!s:>5} {b.best_ask!s:>5} {b.spread!s:>5} "
+                  f"{b.bid_size_at_touch!s:>7} {b.ask_size_at_touch!s:>7} {m.liquidity_usd:>9,.0f} {end:>10} {','.join(m.tags)[:30]}")
+        quotable = sum(1 for m in markets if (b := books.get(m.yes.token_id)) and b.spread and b.spread >= Decimal("0.02"))
+        print(f"\n{len(markets)} markets selected; {quotable} with spread >= 0.02; "
+              f"{sum(1 for m in markets if m.end_date)} with a known end date.")
+        return 0
+    finally:
+        await v.stop()
+
+
 def _run(cfg: Config) -> int:
     from .engine import Engine
 
     if cfg.mode is Mode.LIVE and not cfg.secrets.live_trading_ack:
         print("Refusing to start LIVE: set LIVE_TRADING=yes in .env after reading README 'Going live'.")
         return 2
+    print(f"venue={cfg.venue} mode={cfg.mode.value}  (Ctrl+C to stop; create a file named "
+          f"{cfg.risk.kill_switch_file} to halt without stopping)")
     engine = Engine(cfg)
 
     async def _main():
