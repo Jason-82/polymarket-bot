@@ -669,7 +669,14 @@ class PolymarketUSVenue:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        from polymarket_us import AsyncPolymarketUS
+        try:
+            from polymarket_us import AsyncPolymarketUS
+        except ImportError as e:
+            raise SystemExit(
+                "The Polymarket US SDK is not installed for THIS Python interpreter.\n"
+                "In this same terminal run:\n\n    python -m pip install polymarket-us\n\n"
+                "(use `python -m pip`, not bare `pip`, so it installs into the interpreter that runs the bot)"
+            ) from e
         s = cfg.secrets
         self.public = AsyncPolymarketUS(
             key_id=s.us_key_id or None, secret_key=s.us_secret_key or None,
