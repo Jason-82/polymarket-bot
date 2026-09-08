@@ -15,6 +15,8 @@ universe:
   exclude_tags: [sports]        # sports/esports: highest taker fee, fastest tape; detected by tag or "X vs Y"
   include_neg_risk: true
   max_event_markets: 12         # complete neg-risk events only up to this many candidates
+  prefer_rewards: true          # rank markets with a liquidity-rewards pool first (by $/day)
+  min_reward_rate_per_day: 0    # e.g. 20 to ignore pools smaller than $20/day
   # Optional explicit list of condition IDs; when non-empty, filters above are ignored.
   condition_ids: []
 
@@ -30,10 +32,17 @@ risk:
 
 execution:
   requote_epsilon: 0.005          # don't replace a resting order for a smaller price move
-  min_seconds_between_requotes: 3
+  min_seconds_between_requotes: 10  # every replace loses queue position; be patient
+  size_change_band: 0.25          # replace on size only if it differs by more than 25%
   taker_retry_seconds: 5
   paper_starting_cash_usd: 300
-  fill_poll_seconds: 2
+  fill_poll_seconds: 2            # live: status poll cadence when the user feed is down
+  reconcile_seconds: 20           # live: status poll cadence while the user feed is up
+
+alerts:                           # Telegram; token and chat id live in .env
+  feed_down_seconds: 60
+  on_fills: true
+  heartbeat_hours: 6
 
 strategies:
   complete_set:
@@ -54,6 +63,9 @@ strategies:
     inventory_skew_per_share: 0.0005
     sell_inventory: true          # also post asks on tokens we hold (two-sided quote)
     stale_after_seconds: 15
+    hold_within: 0.01             # keep an existing quote if the new target is within this (queue position)
+    rewards_first: true           # in incentivised markets, quote inside the qualifying spread at qualifying size
+    reward_spread_buffer: 0.005   # stay this far inside the max qualifying spread
 
   favorite_yield:
     enabled: false

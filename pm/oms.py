@@ -50,7 +50,9 @@ class OMS:
                 await self._place(it)
                 continue
             price_moved = abs(cur.price - it.price) >= self.cfg.requote_epsilon
-            size_changed = cur.remaining != it.size
+            # Size: compare against the ORIGINAL size (a partial fill must not trigger a replace),
+            # and only act on a material change; every replace costs queue position.
+            size_changed = abs(it.size - cur.size) > cur.size * self.cfg.size_change_band
             if not price_moved and not size_changed:
                 continue
             if now - self._last_replace.get(tag, 0.0) < self.cfg.min_seconds_between_requotes:

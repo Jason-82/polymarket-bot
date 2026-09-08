@@ -1,11 +1,15 @@
 """Live exchange on py-clob-client-v2 (CLOB V2).
 
-The SDK is synchronous; every call runs in a worker thread. Fills are derived by
-polling order state (size_matched deltas), which depends only on endpoints we
-know exist and behaves identically for maker and taker fills.
+The SDK is synchronous; every call runs in a worker thread. Order state
+arrives two ways and both feed the same reconciliation:
+- the authenticated user WebSocket channel (order events with size_matched),
+  which is fast, and
+- polling of open orders / individual orders, which is the reconciliation
+  fallback (every reconcile_seconds while the feed is up, fill_poll_seconds
+  when it is down).
 
-On start the bot cancels ALL open orders for the account: it assumes it is the
-only thing trading on this wallet.
+On start the bot cancels ALL open orders for the account: it assumes it is
+the only thing trading on this wallet.
 """
 
 from __future__ import annotations
@@ -34,6 +38,8 @@ class LiveExchange:
         self._fills: list[Fill] = []
         self._last_poll = 0.0
         self._lock = asyncio.Lock()
+        self.creds: tuple[str, str, str] = ("", "", "")
+        self.user_feed_ok = False   # set by the engine from UserFeed.connected
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -43,7 +49,7 @@ class LiveExchange:
         if not s.private_key:
             raise ExchangeError("PM_PRIVATE_KEY is required for live mode")
         try:
-            import py_clob_client_v2 as sdk  # noqa: WPS433 (lazy: only live needs it)
+            import py_clob_client_v2 as sdk  # lazy: only live needs it
         except ImportError as e:
             raise ExchangeError("pip install py-clob-client-v2") from e
         self._sdk = sdk
@@ -68,6 +74,7 @@ class LiveExchange:
             print(f"PM_CLOB_API_KEY={creds.api_key}")
             print(f"PM_CLOB_API_SECRET={creds.api_secret}")
             print(f"PM_CLOB_API_PASSPHRASE={creds.api_passphrase}\n")
+        self.creds = (creds.api_key, creds.api_secret, creds.api_passphrase)
 
         await asyncio.to_thread(self._client.cancel_all)
         bal = await self.balance()
@@ -80,6 +87,23 @@ class LiveExchange:
                 await asyncio.to_thread(self._client.cancel_all)
             except Exception as e:
                 log.error("live_cancel_all_failed", error=str(e)[:200])
+
+    # ------------------------------------------------------------------ user feed hooks (sync)
+    def on_user_order(self, msg: dict[str, Any]) -> None:
+        oid = str(msg.get("id") or "")
+        o = self._orders.get(oid)
+        if o is None or o.status is not OrderStatus.OPEN:
+            return
+        kind = str(msg.get("type") or "").upper()
+        status = str(msg.get("status") or "").lower()
+        still_open = kind != "CANCELLATION" and status not in ("matched", "cancelled", "canceled")
+        self._apply_row(o, msg, still_open=still_open)
+
+    def on_user_trade(self, msg: dict[str, Any]) -> None:
+        # Trades carry richer info (fees, maker/taker side) but order events already give us
+        # size_matched; we only log here to keep one source of truth for fills.
+        log.debug("user_trade", id=msg.get("id"), status=msg.get("status"), side=msg.get("side"),
+                  size=msg.get("size"), price=msg.get("price"))
 
     # ------------------------------------------------------------------ exchange API
     async def place(self, intent: Intent) -> Order:
@@ -117,7 +141,6 @@ class LiveExchange:
         self._orders[order_id] = order
         status = str(resp.get("status") or "")
         if intent.tif is not TimeInForce.GTC or status == "matched":
-            # Immediate order: resolve its final state now.
             await self._reconcile_order(order)
         return order
 
@@ -140,7 +163,8 @@ class LiveExchange:
 
     async def drain_fills(self) -> list[Fill]:
         now = time.time()
-        if now - self._last_poll >= self.cfg.execution.fill_poll_seconds and self._orders:
+        interval = self.cfg.execution.reconcile_seconds if self.user_feed_ok else self.cfg.execution.fill_poll_seconds
+        if now - self._last_poll >= interval and self._orders:
             self._last_poll = now
             await self._poll()
         out, self._fills = self._fills, []

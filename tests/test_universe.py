@@ -39,6 +39,9 @@ class _Gamma:
 
 
 class _Clob:
+    async def rewards_by_condition(self):
+        return {}
+
     async def enrich_market(self, m):
         m.fee_known = True
         return m

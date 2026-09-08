@@ -25,6 +25,8 @@ class UniverseConfig:
     exclude_tags: list[str] = field(default_factory=lambda: ["sports"])
     include_neg_risk: bool = True
     max_event_markets: int = 12      # neg-risk events larger than this are not completed
+    prefer_rewards: bool = True      # rank incentivised markets first (by daily reward pool)
+    min_reward_rate_per_day: Decimal = Decimal("0")   # optional floor when prefer_rewards
     condition_ids: list[str] = field(default_factory=list)
 
 
@@ -46,7 +48,16 @@ class ExecutionConfig:
     min_seconds_between_requotes: float = 3.0
     taker_retry_seconds: float = 5.0              # cooldown before re-firing the same taker tag
     paper_starting_cash_usd: Decimal = Decimal("300")
-    fill_poll_seconds: float = 2.0                # live: how often to poll order status
+    fill_poll_seconds: float = 2.0                # live: order-status poll cadence without the user feed
+    reconcile_seconds: float = 20.0               # live: poll cadence while the user feed is connected
+    size_change_band: Decimal = Decimal("0.25")   # replace a resting order only if size differs by more than this fraction
+
+
+@dataclass
+class AlertsConfig:
+    feed_down_seconds: float = 60.0
+    on_fills: bool = True
+    heartbeat_hours: float = 6.0                  # 0 disables the periodic "alive" message
 
 
 @dataclass
@@ -58,10 +69,14 @@ class Secrets:
     api_secret: str = ""
     api_passphrase: str = ""
     live_trading_ack: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
     @classmethod
     def from_env(cls) -> "Secrets":
         return cls(
+            telegram_bot_token=os.environ.get("PM_TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_chat_id=os.environ.get("PM_TELEGRAM_CHAT_ID", "").strip(),
             private_key=os.environ.get("PM_PRIVATE_KEY", "").strip(),
             funder=os.environ.get("PM_FUNDER", "").strip(),
             signature_type=int(os.environ.get("PM_SIGNATURE_TYPE", "0") or 0),
@@ -81,6 +96,7 @@ class Config:
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
     strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
     secrets: Secrets = field(default_factory=Secrets)
 
@@ -88,6 +104,7 @@ class Config:
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    ws_user_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
     geoblock_url: str = "https://polymarket.com/api/geoblock"
     chain_id: int = 137
 
@@ -106,6 +123,7 @@ class Config:
         cfg.universe = _build(UniverseConfig, raw.get("universe") or {})
         cfg.risk = _build(RiskConfig, raw.get("risk") or {})
         cfg.execution = _build(ExecutionConfig, raw.get("execution") or {})
+        cfg.alerts = _build(AlertsConfig, raw.get("alerts") or {})
         cfg.strategies = dict(raw.get("strategies") or {})
         cfg.secrets = Secrets.from_env()
         return cfg

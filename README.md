@@ -62,6 +62,37 @@ Adding one: create `pm/strategy/<name>.py`, decorate the class with
 `@register("<name>")`, implement `on_tick(ctx) -> list[Intent]`, and add a
 block under `strategies:` in `config.yaml`.
 
+## Measuring whether it works: markouts
+
+`python -m pm status` prints, per strategy and per token, three numbers in
+cents per share:
+
+- **capture**: how far inside the midpoint we were filled (the spread we earned).
+- **drift 30s / 300s**: how the midpoint moved after the fill. Negative means
+  the market moved against us, i.e. we were picked off.
+- **net**: capture plus drift. This is the number that decides whether a
+  market is worth quoting.
+
+Run it with `--since-hours 24` to look at one day. Tokens with persistently
+negative net belong in `exclude` lists or need a wider spread.
+
+## Scale features
+
+- **Reward-aware universe.** With `prefer_rewards: true` the bot pulls the
+  liquidity-rewards program and ranks incentivised markets first by daily
+  pool. In those markets the maker quotes inside the qualifying spread at the
+  qualifying size, so resting orders score every second whether or not they
+  fill.
+- **Queue-position-aware quoting.** A resting order within `hold_within` of
+  the new target is kept rather than replaced; the OMS also ignores partial
+  fills and size changes under `size_change_band`. Every cancel/replace goes
+  to the back of the queue.
+- **Live fills from the user WebSocket channel**, with periodic polling as a
+  reconciliation fallback.
+- **Telegram alerts** (set `PM_TELEGRAM_BOT_TOKEN` and `PM_TELEGRAM_CHAT_ID`
+  in `.env`): start/stop, kill switch, feed down, daily loss halt, fills, and
+  a periodic heartbeat.
+
 ## How paper fills work (read this before trusting paper P&L)
 
 - Taker orders fill by walking the live book, with the venue fee applied.

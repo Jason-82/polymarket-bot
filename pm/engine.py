@@ -7,11 +7,12 @@ import time
 from decimal import Decimal
 from typing import Optional
 
+from .alerts import Alerts
 from .clob import Clob, Geoblock
 from .config import Config
 from .execution import Exchange, Recorder
 from .execution.paper import PaperExchange
-from .feed import MarketFeed, Trade
+from .feed import MarketFeed, Trade, UserFeed
 from .gamma import Gamma
 from .log import get_logger
 from .models import ZERO, Book, Mode
@@ -46,8 +47,14 @@ class Engine:
         self.risk = RiskGate(cfg.risk, self.mode)
         self.exchange: Exchange = self._make_exchange()
         self.oms = OMS(self.exchange, cfg.execution, self.store)
+        self.alerts = Alerts(cfg.secrets.telegram_bot_token, cfg.secrets.telegram_chat_id)
+        self.user_feed: Optional[UserFeed] = None
         self._stop = asyncio.Event()
         self._halted = False
+        self._feed_down_since: Optional[float] = None
+        self._feed_down_alerted = False
+        self._loss_halt_alerted = False
+        self._last_heartbeat = time.time()
         self.ticks = 0
 
     def _make_exchange(self) -> Exchange:
@@ -93,10 +100,16 @@ class Engine:
             bal = await self.exchange.balance()
             if bal is not None:
                 self.pf.cash = bal
+            key, secret, passphrase = self.exchange.creds
+            if key:
+                self.user_feed = UserFeed(self.cfg.ws_user_url, key, secret, passphrase,
+                                          self.exchange.on_user_order, self.exchange.on_user_trade)
+                self.user_feed.start()
         self.pf.roll_day(self.ms.books)
         self.store.event("start", f"mode={self.mode.value} markets={len(self.ms.markets)}")
         log.info("engine_started", mode=self.mode.value, markets=len(self.ms.markets), tokens=len(self.ms.token_ids),
-                 cash=str(self.pf.cash))
+                 cash=str(self.pf.cash), alerts=self.alerts.enabled)
+        self.alerts.fire(f"pm started: mode={self.mode.value} markets={len(self.ms.markets)} cash={self.pf.cash:.2f}")
 
     async def _shutdown(self) -> None:
         log.info("engine_stopping")
@@ -106,11 +119,38 @@ class Engine:
                 await self.exchange.stop()
         finally:
             await self.feed.stop()
+            if self.user_feed is not None:
+                await self.user_feed.stop()
             self.store.event("stop", f"ticks={self.ticks}")
             self.store.close()
             await self.gamma.aclose()
             await self.clob.aclose()
+            await self.alerts.send(f"pm stopped: ticks={self.ticks} equity={self.pf.equity(self.ms.books):.2f}")
+            await self.alerts.aclose()
         log.info("engine_stopped", ticks=self.ticks)
+
+    # ------------------------------------------------------------------ health
+    def _check_health(self, now: float) -> None:
+        a = self.cfg.alerts
+        if self.mode is Mode.LIVE and self.user_feed is not None:
+            self.exchange.user_feed_ok = self.user_feed.connected
+        if self.feed.connected or not self.ms.token_ids:
+            if self._feed_down_alerted:
+                self.alerts.fire("pm: market feed reconnected", key="feed_up")
+            self._feed_down_since, self._feed_down_alerted = None, False
+        else:
+            self._feed_down_since = self._feed_down_since or now
+            if not self._feed_down_alerted and now - self._feed_down_since > a.feed_down_seconds:
+                self._feed_down_alerted = True
+                log.error("feed_down", seconds=int(now - self._feed_down_since))
+                self.alerts.fire(f"pm: market feed down for {int(now - self._feed_down_since)}s", key="feed_down")
+        if a.heartbeat_hours > 0 and now - self._last_heartbeat > a.heartbeat_hours * 3600:
+            self._last_heartbeat = now
+            self.alerts.fire(
+                f"pm alive: ticks={self.ticks} equity={self.pf.equity(self.ms.books):.2f} "
+                f"day_pnl={self.pf.day_pnl(self.ms.books):.2f} placed={self.oms.placed} fills_today=?",
+                key="heartbeat",
+            )
 
     # ------------------------------------------------------------------ loop
     async def _loop(self) -> None:
@@ -132,6 +172,7 @@ class Engine:
                     last_balance = t0
 
                 await self._tick()
+                self._check_health(t0)
 
                 if t0 - last_equity > EQUITY_INTERVAL:
                     self._snapshot_equity()
@@ -159,6 +200,7 @@ class Engine:
                 self._halted = True
                 log.critical("kill_switch_engaged", file=self.cfg.risk.kill_switch_file)
                 self.store.event("kill_switch", "engaged")
+                self.alerts.fire("pm: KILL switch engaged, all orders cancelled", key="kill_on")
                 if self.mode is not Mode.READ_ONLY:
                     await self.oms.cancel_all()
             return
@@ -166,12 +208,26 @@ class Engine:
             self._halted = False
             log.warning("kill_switch_released")
             self.store.event("kill_switch", "released")
+            self.alerts.fire("pm: KILL switch released, resuming", key="kill_off")
 
         # Fills first, so strategies see current inventory.
         for f in await self.oms.drain_fills():
             self.pf.apply_fill(f)
             log.info("fill", strategy=f.strategy, side=f.side.value, token=f.token_id[:10], size=str(f.size),
                      price=str(f.price), fee=str(f.fee), maker=f.maker)
+            if self.cfg.alerts.on_fills:
+                m = self.ms.market_for(f.token_id)
+                q = (m.question[:50] if m else f.token_id[:10])
+                self.alerts.fire(f"fill {f.strategy} {f.side.value} {f.size}@{f.price} {q}", key=f"fill:{f.order_id}")
+
+        day_pnl = self.pf.day_pnl(self.ms.books)
+        if day_pnl <= -self.cfg.risk.daily_loss_limit_usd:
+            if not self._loss_halt_alerted:
+                self._loss_halt_alerted = True
+                log.error("daily_loss_limit", day_pnl=str(day_pnl))
+                self.alerts.fire(f"pm: daily loss limit hit (day_pnl={day_pnl:.2f}); new risk blocked", key="loss_halt")
+        else:
+            self._loss_halt_alerted = False
 
         open_orders = await self.exchange.open_orders()
         ctx = build_context(self.ms, self.pf, open_orders, {})

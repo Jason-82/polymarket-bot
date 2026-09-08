@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -86,15 +87,61 @@ class Clob:
         return market
 
     async def rewards_markets(self) -> list[dict[str, Any]]:
-        """Markets currently in the liquidity-rewards program (best effort)."""
-        try:
-            data = await self._get("/rewards/markets/current")
-        except httpx.HTTPError as e:
-            log.warning("rewards_fetch_failed", error=str(e))
-            return []
-        if isinstance(data, dict):
-            return data.get("data") or []
-        return data or []
+        """Raw rows of markets currently in the liquidity-rewards program (paged, best effort)."""
+        out: list[dict[str, Any]] = []
+        cursor = "MA=="
+        for _ in range(200):  # hard stop against a misbehaving cursor
+            try:
+                data = await self._get("/rewards/markets/current", next_cursor=cursor)
+            except httpx.HTTPError as e:
+                log.warning("rewards_fetch_failed", error=str(e)[:200])
+                break
+            if isinstance(data, list):
+                out.extend(data)
+                break
+            out.extend((data or {}).get("data") or [])
+            cursor = str((data or {}).get("next_cursor") or "LTE=")
+            if cursor in ("LTE=", "", "-1"):
+                break
+        return out
+
+    async def rewards_by_condition(self) -> dict[str, "RewardInfo"]:
+        out: dict[str, RewardInfo] = {}
+        for row in await self.rewards_markets():
+            info = reward_from_row(row)
+            if info is not None and info.rate_per_day > 0:
+                out[info.condition_id] = info
+        return out
+
+
+@dataclass(frozen=True)
+class RewardInfo:
+    condition_id: str
+    rate_per_day: Decimal
+    max_spread: Decimal       # price units (the API reports cents)
+    min_size: Decimal
+    competitiveness: Decimal
+
+
+def reward_from_row(row: dict[str, Any]) -> Optional[RewardInfo]:
+    cid = row.get("condition_id") or row.get("conditionId") or (row.get("market") or {}).get("condition_id")
+    if not cid:
+        return None
+    rate = Decimal("0")
+    for cfg in row.get("rewards_config") or []:
+        rate += D(cfg.get("rate_per_day") or cfg.get("rewards_daily_rate") or 0)
+    if rate <= 0:
+        rate = D(row.get("rewards_daily_rate") or row.get("rate_per_day") or 0)
+    spread = D(row.get("rewards_max_spread") or row.get("max_spread") or 0)
+    if spread > 1:            # reported in cents
+        spread = spread / 100
+    return RewardInfo(
+        condition_id=str(cid),
+        rate_per_day=rate,
+        max_spread=spread,
+        min_size=D(row.get("rewards_min_size") or row.get("min_size") or 0),
+        competitiveness=D(row.get("market_competitiveness") or 0),
+    )
 
 
 class Geoblock:

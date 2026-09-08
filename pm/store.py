@@ -37,16 +37,19 @@ CREATE TABLE IF NOT EXISTS events (ts REAL, kind TEXT, detail TEXT);
 
 
 class Store:
-    def __init__(self, path: str | Path, book_snapshot_interval: float = 1.0):
+    def __init__(self, path: str | Path, book_snapshot_interval: float = 0.5, book_heartbeat: float = 10.0):
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(p), isolation_level=None, check_same_thread=False)
+        if str(p) != ":memory:":
+            p.parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(str(p), isolation_level=None, check_same_thread=False, timeout=10)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
         self._buf: list[tuple[str, tuple]] = []
         self._last_book_ts: dict[str, float] = {}
+        self._last_book_key: dict[str, tuple] = {}
         self._snap_interval = book_snapshot_interval
+        self._heartbeat = book_heartbeat
         self._last_flush = time.time()
 
     # ------------------------------------------------------------------ writes (buffered)
@@ -83,6 +86,8 @@ class Store:
             "fee_rate": str(m.fee_rate), "fee_exponent": str(m.fee_exponent), "fee_known": m.fee_known,
             "end_date": m.end_date.isoformat() if m.end_date else None,
             "liquidity_usd": str(m.liquidity_usd), "volume_24h_usd": str(m.volume_24h_usd), "tags": m.tags,
+            "reward_rate_per_day": str(m.reward_rate_per_day), "reward_max_spread": str(m.reward_max_spread),
+            "reward_min_size": str(m.reward_min_size),
         }
         self._q(
             "INSERT OR REPLACE INTO markets(condition_id, question, slug, json, updated_ts) VALUES (?,?,?,?,?)",
@@ -90,10 +95,18 @@ class Store:
         )
 
     def book(self, b: Book, force: bool = False) -> None:
+        """Snapshot on top-of-book change (rate-limited), plus a heartbeat row every 10s."""
         now = time.time()
-        if not force and now - self._last_book_ts.get(b.token_id, 0.0) < self._snap_interval:
-            return
+        key = (b.best_bid, b.best_ask, b.bid_size_at_touch, b.ask_size_at_touch)
+        last_ts = self._last_book_ts.get(b.token_id, 0.0)
+        if not force:
+            unchanged = self._last_book_key.get(b.token_id) == key
+            if unchanged and now - last_ts < self._heartbeat:
+                return
+            if not unchanged and now - last_ts < self._snap_interval:
+                return
         self._last_book_ts[b.token_id] = now
+        self._last_book_key[b.token_id] = key
         self._q(
             "INSERT INTO books(ts, token_id, best_bid, best_ask, bid_sz, ask_sz, top) VALUES (?,?,?,?,?,?,?)",
             (now, b.token_id, _s(b.best_bid), _s(b.best_ask), str(b.bid_size_at_touch), str(b.ask_size_at_touch),
@@ -140,8 +153,87 @@ class Store:
         self.flush()
         return self._db.execute(sql, params).fetchall()
 
-    def summary(self) -> dict[str, Any]:
+    def mid_at(self, token_id: str, ts: float, before: float = 5.0, after: float = 15.0) -> Optional[Decimal]:
+        """Midpoint from the book snapshot nearest to ts within [ts-before, ts+after]."""
+        row = self._db.execute(
+            "SELECT best_bid, best_ask FROM books WHERE token_id=? AND ts BETWEEN ? AND ? "
+            "AND best_bid IS NOT NULL AND best_ask IS NOT NULL ORDER BY ABS(ts-?) LIMIT 1",
+            (token_id, ts - before, ts + after, ts),
+        ).fetchone()
+        if not row:
+            return None
+        return (Decimal(row[0]) + Decimal(row[1])) / 2
+
+    def markouts(self, horizons: tuple[int, ...] = (30, 300), since_ts: float = 0.0) -> dict[str, Any]:
+        """Post-fill price drift: the adverse-selection measurement.
+
+        For each fill: capture = sign * (mid_at_fill - price)      (what the spread paid us)
+                       drift_h = sign * (mid_at(t+h) - mid_at_fill) (what the market did next)
+                       net_h   = capture + drift_h
+        sign is +1 for buys, -1 for sells. All in cents per share, share-weighted.
+        A persistently negative drift means we are being picked off in that market.
+        """
         self.flush()
+        rows = self._db.execute(
+            "SELECT ts, strategy, token_id, side, price, size, maker FROM fills WHERE ts >= ? ORDER BY ts",
+            (since_ts,),
+        ).fetchall()
+        by_strat: dict[str, dict[str, Any]] = {}
+        by_token: dict[str, dict[str, Any]] = {}
+
+        def bucket(d: dict, key: str) -> dict[str, Any]:
+            return d.setdefault(key, {"fills": 0, "shares": Decimal(0), "capture": Decimal(0),
+                                      **{f"drift_{h}": Decimal(0) for h in horizons},
+                                      **{f"n_{h}": Decimal(0) for h in horizons}})
+
+        for ts, strat, tok, side, price, size, maker in rows:
+            price, size = Decimal(price), Decimal(size)
+            sign = Decimal(1) if side == "BUY" else Decimal(-1)
+            mid0 = self.mid_at(tok, ts)
+            if mid0 is None:
+                continue
+            capture = sign * (mid0 - price) * size
+            for b in (bucket(by_strat, strat), bucket(by_token, tok)):
+                b["fills"] += 1
+                b["shares"] += size
+                b["capture"] += capture
+            for h in horizons:
+                midh = self.mid_at(tok, ts + h, before=2.0, after=max(15.0, h * 0.5))
+                if midh is None:
+                    continue
+                drift = sign * (midh - mid0) * size
+                for b in (bucket(by_strat, strat), bucket(by_token, tok)):
+                    b[f"drift_{h}"] += drift
+                    b[f"n_{h}"] += size
+
+        def finish(key: str, b: dict[str, Any]) -> dict[str, Any]:
+            sh = b["shares"] or Decimal(1)
+            out = {"key": key, "fills": b["fills"], "shares": str(b["shares"]),
+                   "capture_c": float(b["capture"] / sh * 100)}
+            for h in horizons:
+                n = b[f"n_{h}"] or Decimal(1)
+                d = b[f"drift_{h}"] / n * 100
+                out[f"drift_{h}s_c"] = float(d)
+                out[f"net_{h}s_c"] = float(b["capture"] / sh * 100 + d)
+                out[f"covered_{h}s"] = str(b[f"n_{h}"])
+            return out
+
+        strat_rows = [finish(k, b) for k, b in by_strat.items()]
+        tok_rows = [finish(k, b) for k, b in by_token.items()]
+        last_h = f"net_{horizons[-1]}s_c"
+        tok_rows.sort(key=lambda r: r[last_h])
+        return {
+            "horizons_s": list(horizons),
+            "fills_measured": sum(b["fills"] for b in by_strat.values()),
+            "by_strategy": strat_rows,
+            "worst_tokens": tok_rows[:5],
+            "best_tokens": list(reversed(tok_rows[-5:])),
+            "units": "cents per share, share-weighted; capture = spread earned at fill, drift = mid move after",
+        }
+
+    def summary(self, since_hours: float = 0.0) -> dict[str, Any]:
+        self.flush()
+        since_ts = time.time() - since_hours * 3600 if since_hours > 0 else 0.0
         q = lambda sql, p=(): self._db.execute(sql, p).fetchone()  # noqa: E731
         out: dict[str, Any] = {}
         out["books_rows"] = q("SELECT COUNT(*) FROM books")[0]
@@ -160,8 +252,9 @@ class Store:
             "SELECT reject_reason, COUNT(*) FROM intents WHERE accepted=0 GROUP BY reject_reason ORDER BY 2 DESC LIMIT 8").fetchall()
         out["top_reject_reasons"] = rej
         by_strat = self._db.execute(
-            "SELECT strategy, COUNT(*), SUM(CAST(size AS REAL)*CAST(price AS REAL)) FROM fills GROUP BY strategy").fetchall()
-        out["fills_by_strategy"] = by_strat
+            "SELECT strategy, COUNT(*), SUM(CAST(size AS REAL)*CAST(price AS REAL)), SUM(maker) FROM fills GROUP BY strategy").fetchall()
+        out["fills_by_strategy"] = [{"strategy": s, "fills": n, "notional": v, "maker": mk} for s, n, v, mk in by_strat]
+        out["markouts"] = self.markouts(since_ts=since_ts)
         return out
 
 

@@ -197,6 +197,15 @@ class Market:
     volume_24h_usd: Decimal = ZERO
     tags: list[str] = field(default_factory=list)
     accepting_orders: bool = True
+    # Liquidity-rewards program parameters (zero when the market is not incentivised)
+    reward_rate_per_day: Decimal = ZERO       # USD paid per day to makers in this market
+    reward_max_spread: Decimal = ZERO         # max distance from midpoint that still scores (price units)
+    reward_min_size: Decimal = ZERO           # min resting size that scores (shares)
+    reward_competitiveness: Decimal = ZERO    # venue's own measure of how contested the pool is
+
+    @property
+    def has_rewards(self) -> bool:
+        return self.reward_rate_per_day > ZERO and self.reward_max_spread > ZERO
 
     @property
     def yes(self) -> Token:

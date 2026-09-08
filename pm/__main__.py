@@ -38,7 +38,8 @@ def main(argv: list[str] | None = None) -> int:
     sr = sub.add_parser("run")
     sr.add_argument("--mode", choices=[m.value for m in Mode])
 
-    sub.add_parser("status")
+    st = sub.add_parser("status")
+    st.add_argument("--since-hours", type=float, default=0.0, help="restrict markouts/equity to this window")
 
     sb = sub.add_parser("backtest")
     sb.add_argument("--since-hours", type=float, default=24.0)
@@ -58,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "run":
             return _run(cfg)
         if args.cmd == "status":
-            return _status(cfg)
+            return _status(cfg, args.since_hours)
         if args.cmd == "backtest":
             from .backtest import run_backtest
             return run_backtest(cfg, since_hours=args.since_hours, tick_seconds=args.tick_seconds)
@@ -186,15 +187,29 @@ def _run(cfg: Config) -> int:
     return 0
 
 
-def _status(cfg: Config) -> int:
+def _status(cfg: Config, since_hours: float = 0.0) -> int:
     from .store import Store
 
     s = Store(cfg.db_path)
     try:
-        summary = s.summary()
+        summary = s.summary(since_hours=since_hours)
     finally:
         s.close()
+    mk = summary.pop("markouts", None)
     print(json.dumps(summary, indent=2, default=str))
+    if mk and mk.get("fills_measured"):
+        hz = mk["horizons_s"]
+        print(f"\nMarkouts ({mk['units']})")
+        print(f"{'strategy/token':40} {'fills':>5} {'shares':>8} {'capture':>8} " +
+              " ".join(f"{'drift'+str(h)+'s':>9} {'net'+str(h)+'s':>8}" for h in hz))
+        for section, rows in (("by strategy", mk["by_strategy"]), ("worst tokens", mk["worst_tokens"]),
+                              ("best tokens", mk["best_tokens"])):
+            print(f"  -- {section}")
+            for r in rows:
+                cells = " ".join(f"{r[f'drift_{h}s_c']:>9.2f} {r[f'net_{h}s_c']:>8.2f}" for h in hz)
+                print(f"  {r['key'][:38]:38} {r['fills']:>5} {r['shares']:>8} {r['capture_c']:>8.2f} {cells}")
+    elif mk is not None:
+        print("\nMarkouts: no fills measured yet.")
     return 0
 
 

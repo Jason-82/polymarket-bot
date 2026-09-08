@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 
 from .clob import Clob
 from .config import UniverseConfig
@@ -21,20 +22,45 @@ class Universe:
         self._fee_cache: dict[str, Market] = {}
 
     async def select(self) -> list[Market]:
+        rewards = await self.clob.rewards_by_condition() if self.cfg.prefer_rewards else {}
         if self.cfg.condition_ids:
             markets = await self.gamma.markets_by_condition(self.cfg.condition_ids)
             markets = await self._complete_neg_risk_events(markets)
+            self._attach_rewards(markets, rewards)
         else:
-            markets = self._pick(await self.gamma.active_markets(limit=max(600, self.cfg.max_markets * 10)))
+            all_markets = await self.gamma.active_markets(limit=max(600, self.cfg.max_markets * 10))
+            self._attach_rewards(all_markets, rewards)
+            markets = self._pick(all_markets)
         markets = await self._enrich(markets)
         groups = len({m.event_id for m in markets if m.neg_risk and m.event_id})
+        incentivised = sum(1 for m in markets if m.has_rewards)
+        pool = sum((m.reward_rate_per_day for m in markets), Decimal("0"))
         log.info("universe_selected", markets=len(markets), tokens=sum(len(m.tokens) for m in markets),
-                 neg_risk_events=groups)
+                 neg_risk_events=groups, incentivised=incentivised, reward_pool_per_day=str(pool),
+                 rewards_known=len(rewards))
         return markets
+
+    @staticmethod
+    def _attach_rewards(markets: list[Market], rewards: dict) -> None:
+        for m in markets:
+            r = rewards.get(m.condition_id)
+            if r is None:
+                continue
+            m.reward_rate_per_day = r.rate_per_day
+            m.reward_max_spread = r.max_spread
+            m.reward_min_size = r.min_size
+            m.reward_competitiveness = r.competitiveness
+
+    def _rank_key(self, m: Market):
+        # Incentivised markets first, biggest daily pool first; volume breaks ties.
+        if self.cfg.prefer_rewards:
+            return (m.reward_rate_per_day, m.volume_24h_usd)
+        return (Decimal("0"), m.volume_24h_usd)
 
     # ------------------------------------------------------------------ selection
     def _pick(self, all_markets: list[Market]) -> list[Market]:
-        """Walk markets by volume; neg-risk markets bring their whole event if it is small enough."""
+        """Walk markets by rank; neg-risk markets bring their whole event if it is small enough."""
+        all_markets = sorted(all_markets, key=self._rank_key, reverse=True)
         by_event: dict[str, list[Market]] = {}
         for m in all_markets:
             if m.event_id and m.accepting_orders and m.is_binary:
@@ -73,6 +99,8 @@ class Universe:
         if m.neg_risk and not c.include_neg_risk:
             return False
         if m.liquidity_usd < c.min_liquidity_usd or m.volume_24h_usd < c.min_volume_24h_usd:
+            return False
+        if c.prefer_rewards and c.min_reward_rate_per_day > 0 and m.reward_rate_per_day < c.min_reward_rate_per_day:
             return False
         excluded = {x.lower() for x in c.exclude_tags}
         if any(t in excluded for t in m.tags):

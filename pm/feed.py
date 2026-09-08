@@ -195,3 +195,101 @@ class MarketFeed:
                 ts=_ts(msg.get("timestamp")),
             ))
         # best_bid_ask / tick_size_change / new_market / market_resolved: informational; books carry the truth.
+
+
+class UserFeed:
+    """Authenticated user channel: our own order and trade events.
+
+    Subscribe: {"auth": {"apiKey","secret","passphrase"}, "type": "user"}  (no markets = all)
+    Events:    order {id, asset_id, side, price, original_size, size_matched, type: PLACEMENT|UPDATE|CANCELLATION}
+               trade {id, asset_id, side, price, size, status, maker_orders[], taker_order_id, trader_side}
+    """
+
+    def __init__(self, url: str, api_key: str, secret: str, passphrase: str,
+                 on_order: Callable[[dict], Any], on_trade: Callable[[dict], Any]):
+        self.url = url
+        self._auth = {"apiKey": api_key, "secret": secret, "passphrase": passphrase}
+        self._on_order = on_order
+        self._on_trade = on_trade
+        self._task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+        self._ws = None
+        self.connected = False
+        self.messages = 0
+        self.last_message_ts = 0.0
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run(), name="user-feed")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _run(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(self.url, ping_interval=None, max_size=2**24) as ws:
+                    self._ws = ws
+                    await ws.send(json.dumps({"auth": self._auth, "type": "user"}))
+                    self.connected = True
+                    backoff = 1.0
+                    log.info("user_feed_connected")
+                    pinger = asyncio.create_task(self._pinger(ws))
+                    try:
+                        async for raw in ws:
+                            self._handle_raw(raw)
+                    finally:
+                        pinger.cancel()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning("user_feed_disconnected", error=str(e)[:200], retry_in=backoff)
+            finally:
+                self.connected = False
+                self._ws = None
+            if self._stop.is_set():
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+    async def _pinger(self, ws) -> None:
+        try:
+            while True:
+                await asyncio.sleep(10)
+                await ws.send("PING")
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def _handle_raw(self, raw: str | bytes) -> None:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        if raw == "PONG" or not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return
+        self.messages += 1
+        self.last_message_ts = time.time()
+        for msg in (data if isinstance(data, list) else [data]):
+            if not isinstance(msg, dict):
+                continue
+            et = msg.get("event_type")
+            try:
+                if et == "order":
+                    self._on_order(msg)
+                elif et == "trade":
+                    self._on_trade(msg)
+            except Exception as e:
+                log.warning("user_feed_bad_message", error=str(e)[:200], event=et)
