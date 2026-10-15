@@ -55,7 +55,7 @@ $20/day loss limit, 10-share quotes.
 | name | what it does | default |
 |---|---|---|
 | `complete_set` | Buys YES+NO (or every YES of a complete neg-risk event) when the asks plus taker fees sum below $1. | on |
-| `maker` | Rests bids on both YES and NO around fair value, inventory-skewed; posts asks on held inventory. Earns spread + liquidity rewards + maker rebates. | on |
+| `maker` | Rests bids on both YES and NO around fair value, inventory-skewed; posts asks on held inventory. Earns spread + liquidity rewards (+ maker rebates where the venue pays them). Refuses crossed books and YES/NO books that disagree. | on |
 | `favorite_yield` | Bids on ≥0.95 outcomes near resolution when the annualised yield clears a threshold. | off |
 
 Adding one: create `pm/strategy/<name>.py`, decorate the class with
@@ -69,7 +69,17 @@ The engine is venue-agnostic. Set `venue:` in `config.yaml` or pass `--venue`.
 | venue | access | fees (per contract) | maker programs |
 |---|---|---|---|
 | `polymarket` | international CLOB V2, pUSD on Polygon, IP-gated | taker `rate × p(1−p)` by category (0 to 0.07); maker 0 | liquidity rewards + rebate share of taker fees |
-| `polymarket_us` | CFTC-regulated, USD, KYC, Ed25519 API keys | taker `0.06 × p(1−p)`; **maker rebate `0.0125 × p(1−p)` paid on every fill** | liquidity rewards scored by ticks from best price |
+| `polymarket_us` | CFTC-regulated, USD, KYC, Ed25519 API keys | taker `0.06 × p(1−p)`; maker rebate **tiered from 2026-10-19**: 0 below $10M/month maker volume (was a flat `0.0125 × p(1−p)` before) | liquidity rewards scored by ticks from best price |
+
+`venue_us.maker_rebate_coef` in `config.yaml` sets the rebate the bot books on
+US maker fills; it defaults to 0, the tier every account under $10M/month is
+in. `complete_set` is disabled on the US venue: each market is a single
+mirrored contract, so YES ask + NO ask is always 1 + spread.
+
+Each venue keeps its own tape (`db_path: data/pm_{venue}.sqlite`), so check
+them separately: `python -m pm status` (international) and
+`python -m pm --venue us status`. Older tapes can be read with
+`python -m pm status --db data/pm.sqlite`.
 
 On Polymarket US each market is one contract with a unified book. The bot
 maps it to a YES token (`<slug>|L`) and a synthetic NO token (`<slug>|S`)

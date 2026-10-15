@@ -61,6 +61,10 @@ class VenueUSConfig:
     ws_max_markets: int = 10          # the venue caps streaming; the rest are REST-polled
     book_poll_seconds: float = 5.0
     max_book_candidates: int = 120    # how many pre-filtered markets to fetch books for when selecting
+    max_event_details: int = 150      # non-sports events re-fetched in full per universe refresh
+    maker_rebate_coef: Decimal = Decimal("0")   # tiered from 2026-10-19; 0 below $10M/month maker volume
+    timeout_seconds: float = 10.0
+    max_retries: int = 1              # SDK retries for idempotent GETs (orders are never retried)
     prefilter_max_spread: Decimal = Decimal("0.15")
     prefilter_band: list = field(default_factory=lambda: [Decimal("0.05"), Decimal("0.95")])
 

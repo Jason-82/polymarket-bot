@@ -14,9 +14,10 @@ import asyncio
 import json
 import sys
 from decimal import Decimal
+from pathlib import Path
 
 from . import __version__
-from .config import Config
+from .config import Config, canonical_venue
 from .log import get_logger, setup
 from .models import ONE, Mode
 
@@ -41,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
 
     st = sub.add_parser("status")
     st.add_argument("--since-hours", type=float, default=0.0, help="restrict markouts/equity to this window")
+    st.add_argument("--db", help="read this SQLite file instead of the venue's tape (e.g. data/pm.sqlite)")
 
     sb = sub.add_parser("backtest")
     sb.add_argument("--since-hours", type=float, default=24.0)
@@ -50,10 +52,11 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config.load(args.config)
     if args.venue:
         cfg.venue = "polymarket_us" if args.venue == "us" else "polymarket"
+    cfg.venue = canonical_venue(cfg.venue)
     if args.cmd == "run" and args.mode:
         cfg.mode = Mode(args.mode)
-    setup(cfg.log_level)
-    is_us = cfg.venue.replace("-", "_") in ("us", "polymarket_us", "polymarketus")
+    setup(cfg.log_level, log_dir=str(Path(cfg.db_file).parent or "data"))
+    is_us = cfg.venue == "polymarket_us"
 
     try:
         if args.cmd == "probe":
@@ -67,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "run":
             return _run(cfg)
         if args.cmd == "status":
-            return _status(cfg, args.since_hours)
+            return _status(cfg, args.since_hours, args.db)
         if args.cmd == "backtest":
             from .backtest import run_backtest
             return run_backtest(cfg, since_hours=args.since_hours, tick_seconds=args.tick_seconds)
@@ -209,8 +212,9 @@ async def _probe_us(cfg: Config, slug: str | None, ws_seconds: float) -> int:
         print(f"  raw values: {json.dumps(keep, default=str)[:1500]}")
         ev_keep = {k: ev.get(k) for k in ("category", "tags", "endDate", "seriesSlug", "teams", "marketCounts", "period")}
         print(f"  event values: {json.dumps(ev_keep, default=str)[:600]}")
-        m = market_from_us(full, ev)
-        print(f"  mapped: question={m.question!r} outcome={m.yes.outcome} end={m.end_date} tags={m.tags} "
+        m = market_from_us(full, ev, maker_rebate_coef=cfg.venue_us.maker_rebate_coef)
+        print(f"  mapped: question={m.question!r} long={m.tokens[0].outcome!r} short={m.tokens[1].outcome!r} "
+              f"yes_token={m.yes.token_id[-2:]} end={m.end_date} tags={m.tags} "
               f"tick={m.tick_size} min_qty={m.min_order_size} accepting={m.accepting_orders} "
               f"fee_rate={m.fee_rate} rebate={m.maker_rebate_rate}")
 
@@ -315,10 +319,15 @@ def _run(cfg: Config) -> int:
     return 0
 
 
-def _status(cfg: Config, since_hours: float = 0.0) -> int:
+def _status(cfg: Config, since_hours: float = 0.0, db: str | None = None) -> int:
     from .store import Store
 
-    s = Store(cfg.db_path)
+    path = db or cfg.db_file
+    if not Path(path).exists():
+        print(f"No tape at {path}. Run the bot on this venue first, or pass --db <file>.")
+        return 1
+    print(f"tape: {path}")
+    s = Store(path)
     try:
         summary = s.summary(since_hours=since_hours)
     finally:

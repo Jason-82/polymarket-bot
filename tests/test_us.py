@@ -10,6 +10,7 @@ from pm.risk import RiskGate
 from pm.state import Portfolio
 from pm.strategy.maker import Maker
 from pm.venues.polymarket_us import (
+    US_MAKER_REBATE_FLAT_2026_07,
     books_from_us, market_from_us, order_params, positions_from_us, quote_hints, split_token, token_ids,
     trades_from_us,
 )
@@ -41,13 +42,18 @@ BOOK = {
 
 def test_market_mapping_and_fees():
     m = market_from_us(ROW)
-    assert m.condition_id == "fed-cut-sep" and m.is_binary
+    assert m.condition_id == "fed-cut-sep" and m.is_binary and m.synthetic_no
     assert m.yes.token_id == "fed-cut-sep|L" and m.no.token_id == "fed-cut-sep|S"
-    assert m.fee_known and m.fee_rate == D("0.06") and m.maker_rebate_rate == D("0.0125")
+    # From 2026-10-19 the rebate is tiered and 0 below $10M/month: that is the default.
+    assert m.fee_known and m.fee_rate == D("0.06") and m.maker_rebate_rate == 0
+    assert maker_rebate(D("0.5"), D(100), m) == 0
     assert "sports" not in m.tags
-    # 100 contracts at 0.50: taker $1.50, maker rebate $0.3125
+    # 100 contracts at 0.50: taker $1.50; with the old flat 0.0125 coefficient the maker got $0.3125
     assert taker_fee(D("0.5"), D(100), m) == D("1.50")
-    assert maker_rebate(D("0.5"), D(100), m) == D("0.3125")
+    flat = market_from_us(ROW, maker_rebate_coef=US_MAKER_REBATE_FLAT_2026_07)
+    assert flat.maker_rebate_rate == D("0.0125") and maker_rebate(D("0.5"), D(100), flat) == D("0.3125")
+    tier2 = market_from_us(ROW, maker_rebate_coef=D("0.0035"))
+    assert maker_rebate(D("0.5"), D(100), tier2) == D("0.0875")
     sport = market_from_us({**ROW, "slug": "nyk-bos", "title": "Knicks vs Celtics", "team": {"id": 1}})
     assert "sports" in sport.tags
     assert market_from_us({**ROW, "status": "MARKET_STATE_HALTED"}).accepting_orders is False
@@ -58,7 +64,7 @@ def test_real_venue_row_shape():
     assert m.question == "U.S Senate Midterm Winner: Republican Party" and m.yes.outcome == "Yes"
     assert m.end_date.isoformat().startswith("2026-11-03")        # earlier of market/event dates
     assert m.tick_size == D("0.001") and m.min_order_size == D(1)
-    assert m.fee_rate == D("0.06") and m.maker_rebate_rate == D("0.0125")
+    assert m.fee_rate == D("0.06") and m.maker_rebate_rate == 0
     assert "politics" in m.tags and "midterms" in m.tags and "type:election" in m.tags
     assert "sports" not in m.tags                                  # sportsMarketType="election" must NOT count
     assert m.accepting_orders
@@ -66,8 +72,25 @@ def test_real_venue_row_shape():
     assert "sports" in market_from_us({**REAL_ROW, "marketType": "moneyline"}, REAL_EVENT).tags
     assert "sports" in market_from_us(REAL_ROW, {**REAL_EVENT, "teams": [{"id": 1}]}).tags
     assert "sports" in market_from_us(REAL_ROW, {**REAL_EVENT, "category": "sports"}).tags
-    assert market_from_us({**REAL_ROW, "feeCoefficient": 0}, REAL_EVENT).maker_rebate_rate == 0
+    assert market_from_us({**REAL_ROW, "feeCoefficient": 0}, REAL_EVENT,
+                          maker_rebate_coef=US_MAKER_REBATE_FLAT_2026_07).maker_rebate_rate == 0
     assert market_from_us({**REAL_ROW, "hidden": True}, REAL_EVENT).accepting_orders is False
+
+
+# marketSides exactly as the venue returned them on 2026-09-08
+SIDES = [{"id": "22653", "identifier": "x", "description": "Yes", "long": True, "tradable": True},
+         {"id": "22654", "identifier": "x", "description": "No", "long": False, "tradable": True}]
+
+
+def test_long_side_label_comes_from_marketsides_not_outcome_order():
+    """The venue returned the same market with outcomes ordered ["No","Yes"] at another time."""
+    flipped = {**REAL_ROW, "outcomes": "[\"No\",\"Yes\"]", "marketSides": SIDES}
+    m = market_from_us(flipped, REAL_EVENT)
+    assert [t.outcome for t in m.tokens] == ["Yes", "No"]
+    assert m.yes.token_id.endswith("|L") and m.no.token_id.endswith("|S")
+    # without marketSides the outcome order is the fallback, and yes/no still never collide
+    bare = market_from_us({**REAL_ROW, "outcomes": "[\"No\",\"Yes\"]"}, REAL_EVENT)
+    assert bare.yes.token_id != bare.no.token_id
 
 
 def test_price_formatting_follows_tick():
@@ -95,15 +118,26 @@ def test_rest_book_unwraps_marketdata():
 
 
 class _Public:
-    """Fake AsyncPolymarketUS exposing just what select_universe uses."""
+    """Fake AsyncPolymarketUS exposing just what select_universe uses.
 
-    def __init__(self, events, books):
-        self._events, self._books = events, books
+    `full` maps event slug -> the complete event returned by GET /v1/events/slug/{slug}; the list call
+    returns only what is passed as `events` (since 2026-10-15: the primary market per event).
+    """
+
+    def __init__(self, events, books, full=None):
+        self._events, self._books, self._full = events, books, full or {}
         self.events = self
         self.markets = self
+        self.detail_calls: list[str] = []
 
     async def list(self, params):                       # events.list
         return {"events": self._events if params.get("offset", 0) == 0 else []}
+
+    async def retrieve_by_slug(self, slug):             # events.retrieve_by_slug
+        self.detail_calls.append(slug)
+        if slug not in self._full:
+            raise RuntimeError("404")
+        return {"event": self._full[slug]}
 
     async def book(self, slug):                          # markets.book
         return {"marketData": self._books[slug]}
@@ -132,6 +166,30 @@ async def test_us_universe_prefilters_and_ranks_by_depth():
     out = await v.select_universe()
     assert [m.condition_id for m in out] == ["deep", "thin"]        # wide (prefilter) and sport (tag) dropped
     assert out[0].liquidity_usd > out[1].liquidity_usd
+
+
+async def test_us_universe_fetches_full_events_since_list_returns_primary_only():
+    from pm.venues.polymarket_us import PolymarketUSVenue
+    cfg = Config()
+    cfg.universe.max_markets = 5
+    cfg.universe.min_liquidity_usd = D(0)
+    cfg.universe.max_days_to_resolution = 365
+    primary = {**REAL_ROW, "slug": "ga-ossoff"}
+    sibling = {**REAL_ROW, "slug": "ga-collins"}
+    book = {"bids": [{"px": {"value": "0.61"}, "qty": "500"}], "offers": [{"px": {"value": "0.63"}, "qty": "500"}]}
+    listed_politics = {**REAL_EVENT, "slug": "ga-senate", "markets": [primary]}
+    listed_sports = {"slug": "nyk-bos", "title": "Knicks vs Celtics", "category": "sports", "teams": [{"id": 1}],
+                     "markets": [{**REAL_ROW, "slug": "nyk-bos-ml"}]}
+    v = PolymarketUSVenue.__new__(PolymarketUSVenue)
+    v.cfg, v.data, v._exchange = cfg, None, None
+    v.public = _Public([listed_politics, listed_sports], {"ga-ossoff": book, "ga-collins": book},
+                       full={"ga-senate": {**listed_politics, "markets": [primary, sibling]}})
+    out = await v.select_universe()
+    assert sorted(m.condition_id for m in out) == ["ga-collins", "ga-ossoff"]
+    assert v.public.detail_calls == ["ga-senate"]                  # sports event not re-fetched
+    # a failing detail call keeps the listed version instead of dropping the event
+    v.public = _Public([listed_politics], {"ga-ossoff": book}, full={})
+    assert [m.condition_id for m in await v.select_universe()] == ["ga-ossoff"]
 
 
 def test_books_mirror_and_split():
@@ -171,10 +229,25 @@ def test_positions_mapping_signed_net():
         "c": {"netPosition": "0", "cost": {"value": "0"}},
     }})
     assert out == {"a|L": (D(30), D("18.00")), "b|S": (D(10), D("4.00"))}
+    # the exact *Decimal field wins over the rounded one
+    exact = positions_from_us({"positions": {"a": {"netPosition": "30", "netPositionDecimal": "29.75",
+                                                   "cost": {"value": "18.00"}}}})
+    assert exact == {"a|L": (D("29.75"), D("18.00"))}
+
+
+async def test_us_client_factory_uses_timeout_and_retries():
+    from pm.venues.polymarket_us import make_client
+    cfg = Config()
+    cfg.venue_us.timeout_seconds, cfg.venue_us.max_retries = 7.0, 1
+    c = make_client(cfg, None, None)
+    try:
+        assert c.timeout == 7.0 and getattr(c, "max_retries", 1) == 1
+    finally:
+        await c.close()
 
 
 async def test_paper_maker_fill_pays_rebate_on_us_market():
-    m = market_from_us(ROW)
+    m = market_from_us(ROW, maker_rebate_coef=US_MAKER_REBATE_FLAT_2026_07)
     px = PaperExchange(lambda t: m, D(300))
     long_b, short_b = books_from_us("fed-cut-sep", BOOK)
     px.on_book(long_b)

@@ -12,11 +12,18 @@ Model mapping
 - The venue nets long and short into cash; local positions are reconciled from
   the portfolio endpoint so equity never double counts.
 
-Fees (effective 2026-07-01): taker 0.06 x C x p(1-p); maker REBATE 0.0125 x C x p(1-p).
+Fees: taker 0.06 x C x p(1-p). Maker rebate: 0.0125 x C x p(1-p) from 2026-07-01 until
+2026-10-19 17:00 UTC; from then it is tiered by prior-month maker volume (under $10M: 0,
+$10M+: 0.0035, $50M+: 0.0070, $200M+: 0.0104). The coefficient is config
+(venue_us.maker_rebate_coef) and defaults to 0, the tier any account below $10M/month is in.
 
 Market data: authenticated WebSocket for up to ws_max_markets slugs (the venue
 limits streaming), REST book polling for the rest. Without API keys only REST
 polling is available.
+
+Discovery: since 2026-10-15 GET /v1/events returns only each event's primary market,
+so non-sports events are re-fetched individually (GET /v1/events/slug/{slug}) to get
+every market.
 """
 
 from __future__ import annotations
@@ -44,8 +51,49 @@ log = get_logger(__name__)
 LONG = "|L"
 SHORT = "|S"
 US_TAKER_RATE = Decimal("0.06")
-US_MAKER_REBATE = Decimal("0.0125")
+US_MAKER_REBATE_FLAT_2026_07 = Decimal("0.0125")   # the pre-2026-10-19 flat rebate, kept for reference/tests
 US_TICK = Decimal("0.01")
+
+
+def make_client(cfg: Config, key_id: Optional[str], secret_key: Optional[str]):
+    """AsyncPolymarketUS with our timeout/retry settings (SDK >= 2.x); falls back for older SDKs."""
+    from polymarket_us import AsyncPolymarketUS
+    u = cfg.venue_us
+    kwargs = dict(key_id=key_id, secret_key=secret_key, gateway_base_url=u.gateway_url, api_base_url=u.api_url,
+                  timeout=float(u.timeout_seconds))
+    try:
+        return AsyncPolymarketUS(**kwargs, max_retries=int(u.max_retries))
+    except TypeError:   # polymarket-us < 2.0 has no max_retries
+        return AsyncPolymarketUS(**kwargs)
+
+
+def long_short_labels(row: dict[str, Any], outcomes: Any) -> tuple[str, str]:
+    """Labels for the long and short side of the contract.
+
+    `marketSides` says which side is long. The order of `outcomes` is not stable across responses
+    (the same market was seen with "Yes" and with "No" first), so it is only a fallback.
+    """
+    sides = row.get("marketSides")
+    if isinstance(sides, list):
+        long_s = next((s for s in sides if isinstance(s, dict) and s.get("long") is True), None)
+        short_s = next((s for s in sides if isinstance(s, dict) and s.get("long") is False), None)
+        if long_s and long_s.get("description"):
+            ll = str(long_s["description"])
+            sl = str(short_s["description"]) if short_s and short_s.get("description") else f"NOT {ll}"
+            return ll, sl
+    outcome = row.get("outcome") or (str(outcomes[0]) if isinstance(outcomes, list) and outcomes else "Yes")
+    return str(outcome), f"NOT {outcome}"
+
+
+def event_is_sports(ev: dict[str, Any]) -> bool:
+    tags: set[str] = set()
+    for k in ("category", "categories", "tags"):
+        v = ev.get(k)
+        for t in (v if isinstance(v, list) else [v]):
+            if t:
+                tags.add(str(t.get("label") if isinstance(t, dict) else t).lower())
+    return bool(ev.get("teams") or ev.get("gameId") or VS_RE.search(str(ev.get("title") or ""))
+                or any(t in SPORT_WORDS or "sport" in t for t in tags))
 
 INTENT = {
     (False, Side.BUY): "ORDER_INTENT_BUY_LONG",
@@ -132,7 +180,8 @@ def quote_hints(row: dict[str, Any]) -> tuple[Optional[Decimal], Optional[Decima
     return bid, ask
 
 
-def market_from_us(row: dict[str, Any], event: Optional[dict[str, Any]] = None) -> Optional[Market]:
+def market_from_us(row: dict[str, Any], event: Optional[dict[str, Any]] = None,
+                   maker_rebate_coef: Decimal = ZERO) -> Optional[Market]:
     slug = row.get("slug")
     if not slug:
         return None
@@ -149,7 +198,7 @@ def market_from_us(row: dict[str, Any], event: Optional[dict[str, Any]] = None) 
             outcomes = json.loads(outcomes)
         except ValueError:
             outcomes = None
-    outcome = row.get("outcome") or (str(outcomes[0]) if isinstance(outcomes, list) and outcomes else "Yes")
+    long_label, short_label = long_short_labels(row, outcomes)
     # Market endDate is often a trading-close buffer months after the event; the event endDate is the
     # resolution-relevant one. Use the earlier of the two.
     dates = []
@@ -182,17 +231,18 @@ def market_from_us(row: dict[str, Any], event: Optional[dict[str, Any]] = None) 
     closed_like = any(w in status for w in ("closed", "resolved", "settled", "halted", "suspended", "expired", "terminated"))
     fee_coef = row.get("feeCoefficient")
     fee_rate = D(fee_coef) if fee_coef is not None else US_TAKER_RATE
-    # The published rebate is exchange-wide (0.0125 against a 0.06 taker rate); scale it if a market's
+    # The rebate coefficient is quoted against the standard 0.06 taker rate; scale it if a market's
     # coefficient differs so a zero-fee market does not pretend to pay a rebate.
-    rebate = (US_MAKER_REBATE * fee_rate / US_TAKER_RATE) if US_TAKER_RATE > ZERO else ZERO
+    rebate = (D(maker_rebate_coef) * fee_rate / US_TAKER_RATE) if US_TAKER_RATE > ZERO else ZERO
     tick = D(row.get("orderPriceMinTickSize") or US_TICK)
     long_id, short_id = token_ids(slug)
     return Market(
         condition_id=slug,
         question=question,
         slug=slug,
-        tokens=[Token(long_id, outcome), Token(short_id, f"NOT {outcome}")],
+        tokens=[Token(long_id, long_label), Token(short_id, short_label)],
         neg_risk=False,
+        synthetic_no=True,
         event_id=str(row.get("eventSlug") or ev.get("slug") or ""),
         event_slug=str(row.get("eventSlug") or ev.get("slug") or ""),
         tick_size=tick if ZERO < tick < ONE else US_TICK,
@@ -283,7 +333,7 @@ def positions_from_us(payload: dict[str, Any]) -> dict[str, tuple[Decimal, Decim
         if not slug or not isinstance(p, dict):
             continue
         slug = (p.get("marketMetadata") or {}).get("slug") or slug
-        net = D(p.get("netPosition") or 0)
+        net = D(p.get("netPositionDecimal") or p.get("netPosition") or 0)   # *Decimal fields are exact
         cost = abs(_amount(p.get("cost") or 0))
         long_id, short_id = token_ids(str(slug))
         if net > ZERO:
@@ -444,10 +494,7 @@ class USExchange:
             raise ExchangeError("LIVE_TRADING=yes is required in .env for live mode")
         if not (s.us_key_id and s.us_secret_key):
             raise ExchangeError("PM_US_KEY_ID and PM_US_SECRET_KEY are required for Polymarket US live mode")
-        from polymarket_us import AsyncPolymarketUS
-        self._client = AsyncPolymarketUS(key_id=s.us_key_id, secret_key=s.us_secret_key,
-                                         gateway_base_url=self.cfg.venue_us.gateway_url,
-                                         api_base_url=self.cfg.venue_us.api_url)
+        self._client = make_client(self.cfg, s.us_key_id, s.us_secret_key)
         await self._client.orders.cancel_all()
         bal = await self.balance()
         self._private_task = asyncio.create_task(self._private_loop(), name="us-private-ws")
@@ -670,18 +717,15 @@ class PolymarketUSVenue:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         try:
-            from polymarket_us import AsyncPolymarketUS
+            import polymarket_us  # noqa: F401
         except ImportError as e:
             raise SystemExit(
                 "The Polymarket US SDK is not installed for THIS Python interpreter.\n"
-                "In this same terminal run:\n\n    python -m pip install polymarket-us\n\n"
+                "In this same terminal run:\n\n    python -m pip install -r requirements.txt\n\n"
                 "(use `python -m pip`, not bare `pip`, so it installs into the interpreter that runs the bot)"
             ) from e
         s = cfg.secrets
-        self.public = AsyncPolymarketUS(
-            key_id=s.us_key_id or None, secret_key=s.us_secret_key or None,
-            gateway_base_url=cfg.venue_us.gateway_url, api_base_url=cfg.venue_us.api_url,
-        )
+        self.public = make_client(cfg, s.us_key_id or None, s.us_secret_key or None)
         self.data: Optional[USMarketData] = None
         self._exchange: Optional[USExchange] = None
 
@@ -711,13 +755,51 @@ class PolymarketUSVenue:
             offset += page
         return out[:limit]
 
+    async def expand_events(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Replace each non-sports event with its full version (all markets), in the original order.
+
+        The list endpoint returns only the primary market per event since 2026-10-15. Sports events are
+        excluded later anyway, so they are not re-fetched. Failures keep the listed version.
+        """
+        cap = int(self.cfg.venue_us.max_event_details)
+        targets = [i for i, ev in enumerate(events) if ev.get("slug") and not event_is_sports(ev)]
+        skipped = targets[cap:]
+        targets = targets[:cap]
+        out = list(events)
+        sem = asyncio.Semaphore(4)
+        failed = 0
+
+        async def one(i: int) -> None:
+            nonlocal failed
+            async with sem:
+                try:
+                    resp = await self.public.events.retrieve_by_slug(events[i]["slug"])
+                except Exception as e:
+                    failed += 1
+                    log.debug("us_event_detail_failed", slug=events[i].get("slug"), error=str(e)[:120])
+                    return
+            full = (resp or {}).get("event") if isinstance((resp or {}).get("event"), dict) else resp
+            if isinstance(full, dict) and isinstance(full.get("markets"), list):
+                out[i] = full
+
+        await asyncio.gather(*(one(i) for i in targets))
+        log.info("us_events_expanded", listed=len(events), fetched=len(targets) - failed, failed=failed,
+                 not_fetched_over_cap=len(skipped),
+                 markets_before=sum(len(e.get("markets") or []) for e in events),
+                 markets_after=sum(len(e.get("markets") or []) for e in out))
+        return out
+
     async def all_markets(self, limit_events: int = 300) -> list[tuple[Market, Optional[Decimal], Optional[Decimal]]]:
         """(market, hinted best bid, hinted best ask) in event order, which is the venue's volume order."""
         out: list[tuple[Market, Optional[Decimal], Optional[Decimal]]] = []
-        for ev in await self.list_events_raw(limit_events):
+        seen: set[str] = set()
+        coef = self.cfg.venue_us.maker_rebate_coef
+        events = await self.expand_events(await self.list_events_raw(limit_events))
+        for ev in events:
             for row in ev.get("markets") or []:
-                m = market_from_us(row, ev)
-                if m and m.accepting_orders:
+                m = market_from_us(row, ev, maker_rebate_coef=coef)
+                if m and m.accepting_orders and m.condition_id not in seen:
+                    seen.add(m.condition_id)
                     bid, ask = quote_hints(row)
                     out.append((m, bid, ask))
         return out
