@@ -50,6 +50,8 @@ class Store:
         self._last_book_key: dict[str, tuple] = {}
         self._snap_interval = book_snapshot_interval
         self._heartbeat = book_heartbeat
+        self._last_intent: dict[str, tuple[tuple, float]] = {}
+        self._intent_heartbeat = 300.0
         self._last_flush = time.time()
 
     # ------------------------------------------------------------------ writes (buffered)
@@ -118,6 +120,16 @@ class Store:
                 (ts, token_id, str(price), str(size), side.value))
 
     def intent(self, it, accepted: bool, reject_reason: str = "") -> None:
+        """Record an intent only when its decision changes (or every intent_heartbeat seconds).
+
+        Strategies re-emit the same intents every tick; writing each one produced ~2M rows in 16 hours.
+        """
+        now = time.time()
+        key = (str(it.price), str(it.size), accepted, reject_reason.split(" (")[0])
+        last = self._last_intent.get(it.tag)
+        if last is not None and last[0] == key and now - last[1] < self._intent_heartbeat:
+            return
+        self._last_intent[it.tag] = (key, now)
         self._q(
             "INSERT INTO intents(ts, strategy, tag, token_id, side, price, size, tif, post_only, reason, accepted, reject_reason)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",

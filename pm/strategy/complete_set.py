@@ -46,6 +46,8 @@ class CompleteSet:
         intents: list[Intent] = []
         seen_events: set[str] = set()
         for m in ctx.markets.values():
+            if m.synthetic_no:
+                continue  # one mirrored contract: YES ask + NO ask = 1 + spread, never an opportunity
             if m.neg_risk and m.event_id:
                 if m.event_id in seen_events:
                     continue
@@ -57,8 +59,12 @@ class CompleteSet:
 
     # ------------------------------------------------------------------ binary
     def _binary(self, ctx: Context, m: Market) -> list[Intent]:
+        if m.yes.token_id == m.no.token_id:
+            return []  # a "set" of one token is not a set
         by, bn = ctx.book(m.yes.token_id), ctx.book(m.no.token_id)
         if not by or not bn or by.best_ask is None or bn.best_ask is None:
+            return []
+        if by.crossed or bn.crossed:
             return []
 
         ay, an = by.best_ask, bn.best_ask
@@ -77,9 +83,10 @@ class CompleteSet:
         edge = ONE - cost
         reason = f"yes_ask={ay} no_ask={an} cost={cost:.4f} edge={edge:.4f}"
         log.info("complete_set_opportunity", market=m.slug, cost=str(cost), size=str(size))
+        grp = f"{self.name}:{m.condition_id}"
         return [
-            self._leg(m, m.yes.token_id, ay, size, reason, "YES"),
-            self._leg(m, m.no.token_id, an, size, reason, "NO"),
+            self._leg(m, m.yes.token_id, ay, size, reason, "YES", grp),
+            self._leg(m, m.no.token_id, an, size, reason, "NO", grp),
         ]
 
     # ------------------------------------------------------------------ neg-risk
@@ -95,9 +102,11 @@ class CompleteSet:
 
         legs: list[tuple[Market, Book, Decimal]] = []
         cost = ZERO
+        if len({m.yes.token_id for m in group}) != len(group):
+            return []
         for m in group:
             b = ctx.book(m.yes.token_id)
-            if not b or b.best_ask is None:
+            if not b or b.best_ask is None or b.crossed:
                 return []
             legs.append((m, b, b.best_ask))
             cost += b.best_ask + _fee(m, b.best_ask)
@@ -110,7 +119,8 @@ class CompleteSet:
             return []
         reason = f"neg_risk n={len(legs)} cost={cost:.4f} edge={(ONE - cost):.4f}"
         log.info("complete_set_neg_risk_opportunity", event=event_id, cost=str(cost), legs=len(legs), size=str(size))
-        return [self._leg(m, m.yes.token_id, a, size, reason, m.yes.outcome) for m, _, a in legs]
+        grp = f"{self.name}:event:{event_id}"
+        return [self._leg(m, m.yes.token_id, a, size, reason, m.condition_id, grp) for m, _, a in legs]
 
     # ------------------------------------------------------------------ helpers
     def _size(self, legs: list[tuple[Book, Decimal]], cost: Decimal, m: Market) -> Decimal:
@@ -120,7 +130,8 @@ class CompleteSet:
         size = _floor_shares(min(avail, by_cap))
         return size if size >= m.min_order_size else ZERO
 
-    def _leg(self, m: Market, token_id: str, price: Decimal, size: Decimal, reason: str, outcome: str) -> Intent:
+    def _leg(self, m: Market, token_id: str, price: Decimal, size: Decimal, reason: str, leg: str,
+             group: str) -> Intent:
         return Intent(
             strategy=self.name,
             token_id=token_id,
@@ -130,5 +141,6 @@ class CompleteSet:
             tif=TimeInForce.FAK,
             post_only=False,
             reason=reason,
-            tag=f"{self.name}:{m.condition_id}:{outcome}",
+            tag=f"{self.name}:{m.condition_id}:{leg}",
+            group=group,
         )

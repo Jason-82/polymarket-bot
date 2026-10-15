@@ -116,6 +116,19 @@ class RiskGate:
             if is_new:
                 accepted_new_orders += 1
 
+        # Grouped intents (e.g. the legs of a complete set) are all-or-nothing: one leg alone is a
+        # directional bet the strategy never asked for. Budget held for dropped legs is simply unused
+        # this tick, which is conservative.
+        failed = {it.group: why for it, why in rep.rejected if it.group}
+        if failed:
+            keep = []
+            for it in rep.accepted:
+                if it.group and it.group in failed:
+                    rep.rejected.append((it, f"group leg rejected: {failed[it.group]}"))
+                else:
+                    keep.append(it)
+            rep.accepted = keep
+
         return rep
 
     @staticmethod

@@ -61,11 +61,14 @@ class OMS:
             if await self._place(it):
                 self._last_replace[tag] = now
 
-        # 3. immediates
+        # 3. immediates. Grouped legs share one cooldown so a set is never fired half at a time.
+        fired: set[str] = set()
         for it in immediates:
-            if now - self._last_taker.get(it.tag, 0.0) < self.cfg.taker_retry_seconds:
+            key = it.group or it.tag
+            if key not in fired and now - self._last_taker.get(key, 0.0) < self.cfg.taker_retry_seconds:
                 continue
-            self._last_taker[it.tag] = now
+            fired.add(key)
+            self._last_taker[key] = now
             await self._place(it)
 
     async def cancel_all(self) -> None:

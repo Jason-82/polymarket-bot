@@ -10,7 +10,7 @@ venue_us:
   prefilter_max_spread: 0.15    # from the listing's quoted bid/ask, before fetching books
   prefilter_band: [0.05, 0.95]
 tick_seconds: 1.0      # strategy evaluation cadence
-db_path: data/pm.sqlite
+db_path: data/pm_{venue}.sqlite   # one tape per venue: data/pm_polymarket.sqlite, data/pm_polymarket_us.sqlite
 log_level: INFO
 
 universe:
@@ -58,6 +58,9 @@ strategies:
     margin: 0.01                  # require cost < 1 - margin after fees
     max_legs_notional_usd: 30
     taker: true                   # this strategy takes; fee is included in the math
+    venue_overrides:
+      polymarket_us:              # one mirrored contract per market: YES ask + NO ask is always 1 + spread
+        enabled: false
 
   maker:
     enabled: true

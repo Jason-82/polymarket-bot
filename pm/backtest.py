@@ -45,7 +45,7 @@ def run_backtest(cfg: Config, since_hours: float = 24.0, tick_seconds: float = 5
 
 
 async def _run(cfg: Config, since_hours: float, tick_seconds: float) -> int:
-    tape = Store(cfg.db_path)
+    tape = Store(cfg.db_file)
     scratch = Store(":memory:")
     try:
         markets = [market_from_json(json.loads(r[0])) for r in tape.query("SELECT json FROM markets")]

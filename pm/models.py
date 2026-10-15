@@ -94,6 +94,11 @@ class Book:
         return self.best_ask - self.best_bid
 
     @property
+    def crossed(self) -> bool:
+        """Best bid at or through best ask: a broken or mid-update book. Never trade on it."""
+        return self.best_bid is not None and self.best_ask is not None and self.best_bid >= self.best_ask
+
+    @property
     def bid_size_at_touch(self) -> Decimal:
         return self.bids[0].size if self.bids else ZERO
 
@@ -198,6 +203,9 @@ class Market:
     volume_24h_usd: Decimal = ZERO
     tags: list[str] = field(default_factory=list)
     accepting_orders: bool = True
+    # True when the NO token is synthetic: one contract whose short book is the mirror of the long
+    # book (Polymarket US). YES ask + NO ask is then always 1 + spread, so no complete set exists.
+    synthetic_no: bool = False
     # Liquidity-rewards program parameters (zero when the market is not incentivised)
     reward_rate_per_day: Decimal = ZERO       # USD paid per day to makers in this market
     reward_max_spread: Decimal = ZERO         # max distance from midpoint that still scores (price units)
@@ -211,16 +219,26 @@ class Market:
     @property
     def yes(self) -> Token:
         for t in self.tokens:
-            if t.outcome.lower() == "yes":
+            if t.outcome.strip().lower() == "yes":
                 return t
+        if len(self.tokens) == 2 and self.tokens[0].outcome.strip().lower() == "no":
+            return self.tokens[1]
         return self.tokens[0]
 
     @property
     def no(self) -> Token:
+        """For a binary market this is ALWAYS the token that is not `yes`.
+
+        Matching on labels alone let both properties resolve to the same token when the first
+        outcome was labelled "No", which made complete_set buy one token twice.
+        """
+        y = self.yes
+        if len(self.tokens) == 2:
+            return self.tokens[1] if self.tokens[0].token_id == y.token_id else self.tokens[0]
         for t in self.tokens:
-            if t.outcome.lower() == "no":
+            if t.outcome.strip().lower() == "no" and t.token_id != y.token_id:
                 return t
-        return self.tokens[1] if len(self.tokens) > 1 else self.tokens[0]
+        return y
 
     @property
     def is_binary(self) -> bool:
@@ -254,6 +272,7 @@ class Intent:
     post_only: bool = True             # maker by default; taker must opt in
     reason: str = ""
     tag: str = ""                      # stable key, e.g. "maker:<token>:BUY"
+    group: str = ""                    # intents sharing a group are accepted or rejected together
 
     def __post_init__(self) -> None:
         if not self.tag:

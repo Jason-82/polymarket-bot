@@ -52,6 +52,7 @@ class Maker:
         self.reward_spread_buffer = D(params.get("reward_spread_buffer", "0.005"))
         self.join_best = bool(params.get("join_best", False))
         self.min_half_spread = D(params.get("min_half_spread", "0.01"))
+        self.max_book_disagreement = D(params.get("max_book_disagreement", "0.02"))
 
     def on_tick(self, ctx: Context) -> list[Intent]:
         out: list[Intent] = []
@@ -67,7 +68,13 @@ class Maker:
         if not self._usable(by, ctx.now_ts) or not self._usable(bn, ctx.now_ts):
             return []
 
-        # Fair value from both books (they should agree: mid_yes ≈ 1 - mid_no)
+        if m.yes.token_id == m.no.token_id:
+            return []
+        # Fair value from both books. They must agree (mid_yes ≈ 1 - mid_no); when they do not, one book
+        # is stale or the market is mislabelled, and quoting off the average is how you get picked off.
+        disagreement = abs(by.mid - (ONE - bn.mid))
+        if disagreement > max(self.max_book_disagreement, 2 * m.tick_size):
+            return []
         fair = (by.mid + (ONE - bn.mid)) / 2
         if fair < self.band_lo or fair > self.band_hi:
             return []
@@ -144,7 +151,7 @@ class Maker:
         if b.age(now_ts) > self.stale_after:
             return False
         sp = b.spread
-        if sp is None or sp > self.max_book_spread:
+        if sp is None or sp <= ZERO or sp > self.max_book_spread:   # sp <= 0: crossed or locked book
             return False
         if sp < self.min_book_spread and not self.join_best:
             return False

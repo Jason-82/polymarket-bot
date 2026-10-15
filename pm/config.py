@@ -151,6 +151,24 @@ class Config:
     def strategy(self, name: str) -> dict[str, Any]:
         return dict(self.strategies.get(name) or {})
 
+    @property
+    def venue_name(self) -> str:
+        return canonical_venue(self.venue)
+
+    @property
+    def db_file(self) -> str:
+        """db_path with {venue} filled in, so each venue keeps its own tape and equity history."""
+        return self.db_path.replace("{venue}", self.venue_name)
+
+
+def canonical_venue(name: str) -> str:
+    n = (name or "polymarket").lower().replace("-", "_")
+    if n in ("us", "polymarket_us", "polymarketus"):
+        return "polymarket_us"
+    if n in ("polymarket", "intl", "clob"):
+        return "polymarket"
+    return n
+
 
 def _build(cls, data: dict[str, Any]):
     """Instantiate a dataclass from a dict, coercing Decimal fields."""

@@ -48,10 +48,11 @@ def build_strategies(strategy_cfg: dict[str, dict[str, Any]], venue: str = "") -
 
     out: list[Strategy] = []
     for name, params in strategy_cfg.items():
-        if not params or not params.get("enabled", False):
+        resolved = resolve_params(params or {}, venue)   # venue_overrides may switch a strategy on or off
+        if not resolved.get("enabled", False):
             continue
         cls = REGISTRY.get(name)
         if cls is None:
             raise ValueError(f"unknown strategy '{name}' (known: {sorted(REGISTRY)})")
-        out.append(cls(resolve_params(params, venue)))
+        out.append(cls(resolved))
     return out
