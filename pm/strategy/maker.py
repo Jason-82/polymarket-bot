@@ -23,6 +23,7 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Optional
 
+from ..fees import taker_fee_per_share
 from ..log import get_logger
 from ..models import ONE, ZERO, D, Book, Intent, Market, Order, Side, TimeInForce, clamp_price, round_to_tick
 from ..state import Context
@@ -135,14 +136,18 @@ class Maker:
         return hs, size
 
     def _maybe_join(self, px: Optional[Decimal], fair: Decimal, b: Book, m: Market) -> Optional[Decimal]:
-        """If the best bid is better than our target, join it when it still leaves min_half_spread of edge.
+        """If the best bid is better than our target, join it when the edge there is still at least
+        min_half_spread. Edge = distance below fair + the venue's maker rebate per share at that price,
+        so the rule tightens automatically when a venue stops paying makers.
 
         Venues that score liquidity rewards by ticks from the best price pay for being AT the best.
         """
         if not self.join_best or px is None or b.best_bid is None:
             return px
-        if b.best_bid > px and fair - b.best_bid >= self.min_half_spread:
-            return b.best_bid
+        if b.best_bid > px:
+            rebate = taker_fee_per_share(b.best_bid, m.maker_rebate_rate) if m.maker_rebate_rate > ZERO else ZERO
+            if fair - b.best_bid + rebate >= self.min_half_spread:
+                return b.best_bid
         return px
 
     def _usable(self, b: Optional[Book], now_ts: float) -> bool:

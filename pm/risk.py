@@ -47,6 +47,34 @@ class RiskGate:
             rep.rejected = [(i, rep.halt_reason) for i in intents]
             return rep
 
+        # Grouped intents (the legs of a complete set) are all-or-nothing: one leg alone is a directional
+        # bet the strategy never asked for. A failing group is removed and the pass re-run, so budget its
+        # other legs would have used is released to the remaining intents instead of leaking. Removing
+        # intents only frees budget, so this converges in at most one extra pass per newly failed group.
+        excluded: dict[str, str] = {}
+        own_reason: dict[int, str] = {}
+        accepted: list[Intent] = []
+        rejected: list[tuple[Intent, str]] = []
+        for _ in range(1 + len({i.group for i in intents if i.group})):
+            candidates = [i for i in intents if not (i.group and i.group in excluded)]
+            accepted, rejected = self._pass(candidates, ctx)
+            newly = {i.group: why for i, why in rejected if i.group and i.group not in excluded}
+            if not newly:
+                break
+            for i, why in rejected:
+                if i.group in newly:
+                    own_reason[id(i)] = why
+            excluded.update(newly)
+        rep.accepted = accepted
+        rep.rejected = [(i, why) for i, why in rejected if not (i.group and i.group in excluded)]
+        for i in intents:
+            if i.group and i.group in excluded:
+                rep.rejected.append((i, own_reason.get(id(i)) or f"group leg rejected: {excluded[i.group]}"))
+        return rep
+
+    def _pass(self, intents: list[Intent], ctx: Context) -> tuple[list[Intent], list[tuple[Intent, str]]]:
+        """One sequential pass of the per-intent checks with running budget totals."""
+        rep = RiskReport()
         day_pnl = ctx.portfolio.day_pnl(ctx.books)
         loss_limited = day_pnl <= -self.cfg.daily_loss_limit_usd
 
@@ -116,20 +144,7 @@ class RiskGate:
             if is_new:
                 accepted_new_orders += 1
 
-        # Grouped intents (e.g. the legs of a complete set) are all-or-nothing: one leg alone is a
-        # directional bet the strategy never asked for. Budget held for dropped legs is simply unused
-        # this tick, which is conservative.
-        failed = {it.group: why for it, why in rep.rejected if it.group}
-        if failed:
-            keep = []
-            for it in rep.accepted:
-                if it.group and it.group in failed:
-                    rep.rejected.append((it, f"group leg rejected: {failed[it.group]}"))
-                else:
-                    keep.append(it)
-            rep.accepted = keep
-
-        return rep
+        return rep.accepted, rep.rejected
 
     @staticmethod
     def _static_checks(it: Intent, m) -> str:

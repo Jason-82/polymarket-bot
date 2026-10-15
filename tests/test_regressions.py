@@ -45,11 +45,14 @@ def test_complete_set_cannot_buy_one_token_twice_even_on_mislabelled_market():
     short_b = mk_book("ga-collins|S", "0.92", "0.93", bid_sz="26914", ask_sz="6373")
     out = CompleteSet({"margin": 0.01, "max_legs_notional_usd": 30}).on_tick(mk_ctx([m], [long_b, short_b]))
     assert out == []
-    # and the venue flag alone also blocks it
+    # and the venue flag alone also blocks it: uncrossed books that WOULD be a set without the flag
     m2 = _us_like("Yes")
+    m2.fee_rate = D(0)
+    books = [mk_book("ga-collins|L", "0.40", "0.42"), mk_book("ga-collins|S", "0.50", "0.52")]
+    m2.synthetic_no = False
+    assert len(CompleteSet({"margin": 0.01}).on_tick(mk_ctx([m2], books))) == 2   # control: a real opportunity
     m2.synthetic_no = True
-    crossed_l = mk_book("ga-collins|L", "0.10", "0.08")
-    assert CompleteSet({"margin": 0.01}).on_tick(mk_ctx([m2], [crossed_l, short_b])) == []
+    assert CompleteSet({"margin": 0.01}).on_tick(mk_ctx([m2], books)) == []
 
 
 def test_complete_set_ignores_crossed_books():
@@ -88,6 +91,11 @@ async def test_oms_fires_grouped_legs_together_under_one_cooldown():
     assert oms.placed == 2
     await oms.sync(legs)            # cooldown applies to the group: neither leg fires again
     assert oms.placed == 2
+    # The case a per-tag cooldown gets wrong: one leg alone fires, then the full set must still wait.
+    oms2 = OMS(px, ExecutionConfig(taker_retry_seconds=60.0), store)
+    await oms2.sync([legs[0]])
+    await oms2.sync(legs)
+    assert oms2.placed == 1
     store.close()
 
 

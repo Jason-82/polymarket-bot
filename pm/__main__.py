@@ -47,6 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     sb = sub.add_parser("backtest")
     sb.add_argument("--since-hours", type=float, default=24.0)
     sb.add_argument("--tick-seconds", type=float, default=5.0)
+    sb.add_argument("--db", help="replay this SQLite file instead of the venue's tape (e.g. data/pm.sqlite)")
 
     args = p.parse_args(argv)
     cfg = Config.load(args.config)
@@ -55,7 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg.venue = canonical_venue(cfg.venue)
     if args.cmd == "run" and args.mode:
         cfg.mode = Mode(args.mode)
-    setup(cfg.log_level, log_dir=str(Path(cfg.db_file).parent or "data"))
+    tape = Path(cfg.db_file)
+    setup(cfg.log_level, log_dir=str(tape.parent), log_name=tape.with_suffix(".log").name)
     is_us = cfg.venue == "polymarket_us"
 
     try:
@@ -73,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
             return _status(cfg, args.since_hours, args.db)
         if args.cmd == "backtest":
             from .backtest import run_backtest
-            return run_backtest(cfg, since_hours=args.since_hours, tick_seconds=args.tick_seconds)
+            return run_backtest(cfg, since_hours=args.since_hours, tick_seconds=args.tick_seconds, db=args.db)
     except KeyboardInterrupt:
         return 130
     return 0
@@ -222,7 +224,7 @@ async def _probe_us(cfg: Config, slug: str | None, ws_seconds: float) -> int:
         inner = (data or {}).get("marketData") if isinstance((data or {}).get("marketData"), dict) else (data or {})
         print(f"  book keys: {sorted((data or {}).keys())} inner={sorted(inner.keys())} state={inner.get('state')}")
         long_b, short_b = books_from_us(slug, data or {})
-        for name, b in (("LONG " + str(m.yes.outcome), long_b), ("SHORT (mirrored)", short_b)):
+        for name, b in (("LONG " + str(m.tokens[0].outcome), long_b), ("SHORT " + str(m.tokens[1].outcome) + " (mirrored)", short_b)):
             print(f"\n  [{name}] bid={b.best_bid} ask={b.best_ask} spread={b.spread}")
             for lvl in reversed(b.asks[:5]):
                 print(f"      ask {lvl.price}  x {lvl.size}")

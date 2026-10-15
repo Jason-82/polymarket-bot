@@ -2,18 +2,23 @@
 
 Resting intents (GTC): keep if an open order with the same tag is within
 `requote_epsilon` and same size; otherwise cancel + replace, rate-limited.
-Immediate intents (FAK/FOK): fire once, then cool down for the same tag.
+Immediate intents (FAK/FOK): fire once, then cool down for the same tag. Intents
+that share a `group` (the legs of a complete set) fire as a unit: one cooldown,
+each later leg sized to what the earlier legs actually filled, and the group stops
+at the first leg that fills nothing.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from decimal import Decimal
+from typing import Optional
 
 from .config import ExecutionConfig
 from .execution import Exchange, ExchangeError
 from .log import get_logger
-from .models import Fill, Intent, Order, TimeInForce
+from .models import ZERO, Fill, Intent, Order, TimeInForce
 from .store import Store
 
 log = get_logger(__name__)
@@ -61,15 +66,46 @@ class OMS:
             if await self._place(it):
                 self._last_replace[tag] = now
 
-        # 3. immediates. Grouped legs share one cooldown so a set is never fired half at a time.
-        fired: set[str] = set()
+        # 3. immediates, one group at a time (an ungrouped intent is a group of one).
+        groups: dict[str, list[Intent]] = {}
         for it in immediates:
-            key = it.group or it.tag
-            if key not in fired and now - self._last_taker.get(key, 0.0) < self.cfg.taker_retry_seconds:
+            groups.setdefault(it.group or it.tag, []).append(it)
+        for key, legs in groups.items():
+            if now - self._last_taker.get(key, 0.0) < self.cfg.taker_retry_seconds:
                 continue
-            fired.add(key)
             self._last_taker[key] = now
-            await self._place(it)
+            await self._fire_group(key, legs)
+
+    async def _fire_group(self, key: str, legs: list[Intent]) -> None:
+        """Fire legs in order. Each later leg is sized down to the smallest fill so far, and the group
+        stops at the first leg that fills nothing. The only way a set can still end unbalanced is a
+        shortfall on a later leg after earlier legs filled; that is logged and recorded loudly."""
+        if len(legs) == 1:
+            await self._place(legs[0])
+            return
+        size = legs[0].size
+        filled: list[tuple[str, Decimal]] = []
+        for i, it in enumerate(legs):
+            if size < it.size:
+                it = dataclasses.replace(it, size=size)
+            o = await self._place(it)
+            got = o.filled if o is not None else ZERO
+            if got <= ZERO:
+                rest = legs[i + 1:]
+                for r in rest:
+                    self.store.order_event("aborted", r.tag, r.strategy, r.token_id, r.side, r.price, r.size,
+                                           note=f"group {key}: leg {it.tag} filled nothing")
+                if filled:
+                    log.error("group_leg_unhedged", group=key, failed_leg=it.tag, filled=filled)
+                    self.store.event("group_unhedged", f"{key} failed_leg={it.tag} filled={filled}")
+                else:
+                    log.info("group_aborted", group=key, failed_leg=it.tag, skipped=len(rest))
+                return
+            filled.append((it.tag, got))
+            size = min(size, got)
+        if len({g for _, g in filled}) > 1:
+            log.error("group_imbalanced", group=key, filled=filled)
+            self.store.event("group_imbalanced", f"{key} filled={filled}")
 
     async def cancel_all(self) -> None:
         try:
@@ -84,23 +120,24 @@ class OMS:
         return fills
 
     # ------------------------------------------------------------------ internals
-    async def _place(self, it: Intent) -> bool:
+    async def _place(self, it: Intent) -> Optional[Order]:
+        """Place one intent; returns the Order (with `filled` known for immediate orders) or None."""
         try:
             o = await self.x.place(it)
         except ExchangeError as e:
             self.rejected += 1
             self.store.order_event("rejected", it.tag, it.strategy, it.token_id, it.side, it.price, it.size, note=str(e))
             log.info("order_rejected", tag=it.tag, reason=str(e))
-            return False
+            return None
         except Exception as e:
             self.rejected += 1
             self.store.order_event("error", it.tag, it.strategy, it.token_id, it.side, it.price, it.size, note=str(e)[:200])
             log.error("order_error", tag=it.tag, error=str(e)[:200])
-            return False
+            return None
         self.placed += 1
         self.store.order_event("placed", o.tag, o.strategy, o.token_id, o.side, o.price, o.size, order_id=o.order_id, note=it.reason)
         log.info("order_placed", tag=o.tag, side=o.side.value, price=str(o.price), size=str(o.size), tif=o.tif.value)
-        return True
+        return o
 
     async def _cancel(self, o: Order, why: str) -> None:
         try:

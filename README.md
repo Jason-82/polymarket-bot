@@ -76,10 +76,18 @@ US maker fills; it defaults to 0, the tier every account under $10M/month is
 in. `complete_set` is disabled on the US venue: each market is a single
 mirrored contract, so YES ask + NO ask is always 1 + spread.
 
-Each venue keeps its own tape (`db_path: data/pm_{venue}.sqlite`), so check
-them separately: `python -m pm status` (international) and
-`python -m pm --venue us status`. Older tapes can be read with
-`python -m pm status --db data/pm.sqlite`.
+Each venue keeps its own tape (`db_path: data/pm_{venue}.sqlite`) and log
+(`data/pm_{venue}.log`), so both can run at once. Check them separately:
+`python -m pm status` (international) and `python -m pm --venue us status`.
+Tapes recorded before 2026-10-15 are in `data/pm.sqlite`: read them with
+`python -m pm status --db data/pm.sqlite` or
+`python -m pm backtest --db data/pm.sqlite`.
+
+Complete-set legs fire as a unit: each later leg is sized to what the earlier
+legs filled, the set stops at the first leg that fills nothing, and any
+remaining imbalance is logged as `group_imbalanced`. Orders found resting on
+the venue that the bot does not know about are cancelled: run the bot on a
+wallet or account that nothing else trades from.
 
 On Polymarket US each market is one contract with a unified book. The bot
 maps it to a YES token (`<slug>|L`) and a synthetic NO token (`<slug>|S`)

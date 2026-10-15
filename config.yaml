@@ -10,8 +10,11 @@ venue_us:
   max_event_details: 150        # since 2026-10-15 the events list shows one market per event; re-fetch this many
   maker_rebate_coef: 0          # from 2026-10-19 rebates are tiered: 0 below $10M/month maker volume
                                 # (0.0035 at $10M+, 0.0070 at $50M+, 0.0104 at $200M+)
-  timeout_seconds: 10
+  timeout_seconds: 10           # market data / discovery requests
+  order_timeout_seconds: 30     # order creation is never retried by the SDK; give it time
   max_retries: 1
+  expand_timeout_seconds: 60    # cap on re-fetching full events during a universe refresh
+  expand_concurrency: 8
   prefilter_max_spread: 0.15    # from the listing's quoted bid/ask, before fetching books
   prefilter_band: [0.05, 0.95]
 tick_seconds: 1.0      # strategy evaluation cadence
@@ -83,9 +86,10 @@ strategies:
     join_best: true               # if the book is tighter than half_spread, join the best price...
     min_half_spread: 0.01         # ...as long as it is still at least this far from fair
     venue_overrides:
-      polymarket_us:              # ticks of 0.001 and one-tick books: the edge is rebate + rewards, not spread
+      polymarket_us:              # one-tick books; from 2026-10-19 no maker rebate below $10M/month
         half_spread: 0.01
-        min_half_spread: 0.0      # join the best price outright
+        min_half_spread: 0.005    # join the best bid only if it is >= half a cent below fair (+ any rebate):
+                                  # true on 1-cent books, false on 0.1-cent books where joining earns ~nothing
         min_book_spread: 0.0
         min_depth_shares_at_touch: 20
         quote_size_shares: 20

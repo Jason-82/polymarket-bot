@@ -55,12 +55,15 @@ US_MAKER_REBATE_FLAT_2026_07 = Decimal("0.0125")   # the pre-2026-10-19 flat reb
 US_TICK = Decimal("0.01")
 
 
-def make_client(cfg: Config, key_id: Optional[str], secret_key: Optional[str]):
-    """AsyncPolymarketUS with our timeout/retry settings (SDK >= 2.x); falls back for older SDKs."""
+def make_client(cfg: Config, key_id: Optional[str], secret_key: Optional[str], timeout: Optional[float] = None):
+    """AsyncPolymarketUS with our timeout/retry settings (SDK >= 2.x); falls back for older SDKs.
+
+    The trading client gets the longer order_timeout_seconds: order creation is never retried, so a short
+    timeout turns a slow-but-accepted order into an apparent failure."""
     from polymarket_us import AsyncPolymarketUS
     u = cfg.venue_us
     kwargs = dict(key_id=key_id, secret_key=secret_key, gateway_base_url=u.gateway_url, api_base_url=u.api_url,
-                  timeout=float(u.timeout_seconds))
+                  timeout=float(timeout if timeout is not None else u.timeout_seconds))
     try:
         return AsyncPolymarketUS(**kwargs, max_retries=int(u.max_retries))
     except TypeError:   # polymarket-us < 2.0 has no max_retries
@@ -494,7 +497,8 @@ class USExchange:
             raise ExchangeError("LIVE_TRADING=yes is required in .env for live mode")
         if not (s.us_key_id and s.us_secret_key):
             raise ExchangeError("PM_US_KEY_ID and PM_US_SECRET_KEY are required for Polymarket US live mode")
-        self._client = make_client(self.cfg, s.us_key_id, s.us_secret_key)
+        self._client = make_client(self.cfg, s.us_key_id, s.us_secret_key,
+                                   timeout=self.cfg.venue_us.order_timeout_seconds)
         await self._client.orders.cancel_all()
         bal = await self.balance()
         self._private_task = asyncio.create_task(self._private_loop(), name="us-private-ws")
@@ -530,6 +534,12 @@ class USExchange:
         try:
             resp = await self._client.orders.create(params)
         except Exception as e:
+            # Order creation is never retried by the SDK, and a timeout does not mean the venue rejected it.
+            # Look for it among open orders before reporting failure, so it is tracked, not orphaned.
+            adopted = await self._adopt(intent, params)
+            if adopted is not None:
+                log.warning("us_order_adopted_after_error", tag=intent.tag, order_id=adopted.order_id, error=str(e)[:120])
+                return adopted
             raise ExchangeError(str(e)[:300]) from e
         if not isinstance(resp, dict) or not resp.get("id"):
             raise ExchangeError(f"unexpected response: {resp!r}"[:300])
@@ -565,8 +575,10 @@ class USExchange:
 
     async def drain_fills(self) -> list[Fill]:
         now = time.time()
-        interval = self.cfg.execution.reconcile_seconds if self.private_connected else self.cfg.execution.fill_poll_seconds
-        if now - self._last_poll >= interval and self._orders:
+        # Poll even with nothing tracked (at the slow cadence) so orphaned venue orders are swept.
+        fast = self._orders and not self.private_connected
+        interval = self.cfg.execution.fill_poll_seconds if fast else self.cfg.execution.reconcile_seconds
+        if now - self._last_poll >= interval:
             self._last_poll = now
             await self._poll()
         out, self._fills = self._fills, []
@@ -594,6 +606,29 @@ class USExchange:
         return positions_from_us(resp or {})
 
     # ---- internals
+    async def _adopt(self, intent: Intent, params: dict[str, Any]) -> Optional[Order]:
+        """Find an untracked open order matching what we just tried to create."""
+        slug = params["marketSlug"]
+        try:
+            resp = await self._client.orders.list({"slugs": [slug]})
+        except Exception as e:
+            log.warning("us_adopt_lookup_failed", slug=slug, error=str(e)[:120])
+            return None
+        want_px, want_qty = D(params["price"]["value"]), D(params["quantity"])
+        for r in (resp or {}).get("orders") or []:
+            oid = str(r.get("id") or "")
+            if not oid or oid in self._orders:
+                continue
+            if (r.get("marketSlug") in (None, slug) and r.get("intent") == params["intent"]
+                    and _amount(r.get("price")) == want_px and D(r.get("quantity") or 0) == want_qty):
+                order = Order(order_id=oid, tag=intent.tag, strategy=intent.strategy, token_id=intent.token_id,
+                              side=intent.side, price=intent.price, size=intent.size, tif=intent.tif,
+                              post_only=intent.post_only)
+                self._orders[oid] = order
+                self._apply_order_row(order, r)
+                return order
+        return None
+
     async def _poll(self) -> None:
         async with self._lock:
             try:
@@ -610,6 +645,15 @@ class USExchange:
                     self._apply_order_row(o, row)
                 else:
                     await self._reconcile_order(o)
+            # Orphans: resting on the venue but unknown to us. Risk limits cannot see them, so cancel.
+            # The bot assumes it is the only trader on this account (it cancels everything on start/stop).
+            for oid, r in live.items():
+                if oid and oid not in self._orders:
+                    try:
+                        await self._client.orders.cancel(oid, {"marketSlug": r.get("marketSlug") or ""})
+                        log.warning("us_orphan_order_cancelled", order_id=oid, slug=r.get("marketSlug"))
+                    except Exception as e:
+                        log.error("us_orphan_cancel_failed", order_id=oid, error=str(e)[:200])
 
     async def _reconcile_order(self, o: Order) -> None:
         try:
@@ -761,30 +805,41 @@ class PolymarketUSVenue:
         The list endpoint returns only the primary market per event since 2026-10-15. Sports events are
         excluded later anyway, so they are not re-fetched. Failures keep the listed version.
         """
-        cap = int(self.cfg.venue_us.max_event_details)
-        targets = [i for i, ev in enumerate(events) if ev.get("slug") and not event_is_sports(ev)]
+        u = self.cfg.venue_us
+        cap = int(u.max_event_details)
+        sports_excluded = "sports" in {t.lower() for t in self.cfg.universe.exclude_tags}
+        targets = [i for i, ev in enumerate(events)
+                   if ev.get("slug") and not (sports_excluded and event_is_sports(ev))]
         skipped = targets[cap:]
         targets = targets[:cap]
         out = list(events)
-        sem = asyncio.Semaphore(4)
-        failed = 0
+        sem = asyncio.Semaphore(max(1, int(u.expand_concurrency)))
+        stats = {"fetched": 0, "failed": 0}
 
         async def one(i: int) -> None:
-            nonlocal failed
             async with sem:
                 try:
                     resp = await self.public.events.retrieve_by_slug(events[i]["slug"])
+                    full = resp.get("event") if isinstance(resp, dict) and isinstance(resp.get("event"), dict) else resp
+                    if not (isinstance(full, dict) and isinstance(full.get("markets"), list)):
+                        raise ValueError(f"unexpected event payload type {type(resp).__name__}")
                 except Exception as e:
-                    failed += 1
+                    stats["failed"] += 1
                     log.debug("us_event_detail_failed", slug=events[i].get("slug"), error=str(e)[:120])
                     return
-            full = (resp or {}).get("event") if isinstance((resp or {}).get("event"), dict) else resp
-            if isinstance(full, dict) and isinstance(full.get("markets"), list):
-                out[i] = full
+            out[i] = full
+            stats["fetched"] += 1
 
-        await asyncio.gather(*(one(i) for i in targets))
-        log.info("us_events_expanded", listed=len(events), fetched=len(targets) - failed, failed=failed,
-                 not_fetched_over_cap=len(skipped),
+        # Bounded: the engine waits for the universe refresh, so a slow venue must not stall quoting.
+        # Events not fetched in time keep their listed (primary-market-only) version.
+        timed_out = False
+        try:
+            await asyncio.wait_for(asyncio.gather(*(one(i) for i in targets)), timeout=float(u.expand_timeout_seconds))
+        except asyncio.TimeoutError:
+            timed_out = True
+        log.info("us_events_expanded", listed=len(events), fetched=stats["fetched"], failed=stats["failed"],
+                 timed_out=timed_out, not_fetched_over_cap=len(skipped),
+                 sports_skipped=sum(1 for ev in events if sports_excluded and event_is_sports(ev)),
                  markets_before=sum(len(e.get("markets") or []) for e in events),
                  markets_after=sum(len(e.get("markets") or []) for e in out))
         return out

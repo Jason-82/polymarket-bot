@@ -28,6 +28,16 @@ from . import ExchangeError
 log = get_logger(__name__)
 
 
+def skip_settlement_wait(client) -> None:
+    """py-clob-client-v2 >= 1.2 makes post_order poll get_trades for up to 30s after a match, until the
+    trades carry on-chain transaction hashes. That blocks the engine tick and delays the second leg of a
+    set. We never use the hashes (fills come from order state), so the post-processing step is replaced
+    with identity on our client instance only. `defer_exec` is NOT used for this: it is sent to the
+    server and changes how the order executes."""
+    if hasattr(client, "_resolve_transactions_hashes"):
+        client._resolve_transactions_hashes = lambda response: response
+
+
 class LiveExchange:
     def __init__(self, cfg: Config, market_for: Callable[[str], Optional[Market]]):
         self.cfg = cfg
@@ -75,6 +85,7 @@ class LiveExchange:
             print(f"PM_CLOB_API_SECRET={creds.api_secret}")
             print(f"PM_CLOB_API_PASSPHRASE={creds.api_passphrase}\n")
         self.creds = (creds.api_key, creds.api_secret, creds.api_passphrase)
+        skip_settlement_wait(self._client)
 
         await asyncio.to_thread(self._client.cancel_all)
         bal = await self.balance()
@@ -163,8 +174,10 @@ class LiveExchange:
 
     async def drain_fills(self) -> list[Fill]:
         now = time.time()
-        interval = self.cfg.execution.reconcile_seconds if self.user_feed_ok else self.cfg.execution.fill_poll_seconds
-        if now - self._last_poll >= interval and self._orders:
+        # Poll even with nothing tracked (at the slow cadence) so orphaned venue orders are swept.
+        fast = self._orders and not self.user_feed_ok
+        interval = self.cfg.execution.fill_poll_seconds if fast else self.cfg.execution.reconcile_seconds
+        if now - self._last_poll >= interval:
             self._last_poll = now
             await self._poll()
         out, self._fills = self._fills, []
@@ -203,6 +216,15 @@ class LiveExchange:
                     self._apply_row(o, row, still_open=True)
                 else:
                     await self._reconcile_order(o)
+            # Orphans: resting on the venue but unknown to us (e.g. a post that timed out after the venue
+            # accepted it). Risk limits cannot see them, so cancel. The bot assumes it is the only trader
+            # on this wallet (it also cancels everything on start and stop).
+            for oid in [oid for oid in live if oid not in self._orders]:
+                try:
+                    await asyncio.to_thread(self._client.cancel_order, self._sdk.OrderPayload(orderID=oid))
+                    log.warning("orphan_order_cancelled", order_id=oid)
+                except Exception as e:
+                    log.error("orphan_cancel_failed", order_id=oid, error=str(e)[:200])
 
     async def _reconcile_order(self, o: Order) -> None:
         try:

@@ -13,6 +13,7 @@ import json
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from .config import Config
@@ -40,12 +41,17 @@ def market_from_json(row: dict[str, Any]) -> Market:
     )
 
 
-def run_backtest(cfg: Config, since_hours: float = 24.0, tick_seconds: float = 5.0) -> int:
-    return asyncio.run(_run(cfg, since_hours, tick_seconds))
+def run_backtest(cfg: Config, since_hours: float = 24.0, tick_seconds: float = 5.0, db: str | None = None) -> int:
+    path = db or cfg.db_file
+    if not Path(path).exists():   # Store() would create an empty tape, which then fools `status`
+        print(f"No tape at {path}. Run the bot on this venue first, or pass --db <file>.")
+        return 1
+    print(f"tape: {path}")
+    return asyncio.run(_run(cfg, since_hours, tick_seconds, path))
 
 
-async def _run(cfg: Config, since_hours: float, tick_seconds: float) -> int:
-    tape = Store(cfg.db_file)
+async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) -> int:
+    tape = Store(path)
     scratch = Store(":memory:")
     try:
         markets = [market_from_json(json.loads(r[0])) for r in tape.query("SELECT json FROM markets")]

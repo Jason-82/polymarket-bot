@@ -1,6 +1,9 @@
 """Polymarket US venue mapping: markets, books, trades, orders, positions, fees."""
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+
+import pytest
 
 from pm.config import Config, ExecutionConfig, RiskConfig
 from pm.execution.paper import PaperExchange
@@ -146,7 +149,15 @@ class _Public:
         return None
 
 
-async def test_us_universe_prefilters_and_ranks_by_depth():
+@pytest.fixture
+def frozen_universe_clock(monkeypatch):
+    """The fixtures carry the real venue's dates (event ends 2026-11-03); freeze 'now' so these tests do
+    not start failing once that date is within min_days_to_resolution of the wall clock."""
+    import pm.universe
+    monkeypatch.setattr(pm.universe, "utcnow", lambda: datetime(2026, 10, 1, tzinfo=timezone.utc))
+
+
+async def test_us_universe_prefilters_and_ranks_by_depth(frozen_universe_clock):
     from pm.venues.polymarket_us import PolymarketUSVenue
     cfg = Config()
     cfg.universe.max_markets = 2
@@ -168,7 +179,7 @@ async def test_us_universe_prefilters_and_ranks_by_depth():
     assert out[0].liquidity_usd > out[1].liquidity_usd
 
 
-async def test_us_universe_fetches_full_events_since_list_returns_primary_only():
+async def test_us_universe_fetches_full_events_since_list_returns_primary_only(frozen_universe_clock):
     from pm.venues.polymarket_us import PolymarketUSVenue
     cfg = Config()
     cfg.universe.max_markets = 5
@@ -274,10 +285,12 @@ def test_maker_join_best_on_tight_us_book():
     assert RiskGate(RiskConfig(), Mode.PAPER).evaluate(out, mk_ctx([m], [long_b, short_b]), True).accepted
 
 
-def test_maker_joins_one_tick_book_with_us_overrides():
-    """The real Senate book: tick 0.001, bid 0.536 x 460, ask 0.537 x 7429. With the US overrides the maker
-    joins the best bid on both sides instead of standing back for a spread that does not exist."""
+def test_maker_joins_one_tick_book_when_min_half_spread_allows():
+    """The real Senate book: tick 0.001, bid 0.536 x 460, ask 0.537 x 7429. With min_half_spread 0 the maker
+    joins the best bid on both sides. (The shipped US config requires 0.005, so it would not join here:
+    see test_review_fixes.test_shipped_us_maker_joins_cent_books_but_not_tenth_cent_books.)"""
     m = market_from_us(REAL_ROW, REAL_EVENT)
+    m.end_date = datetime.now(timezone.utc) + timedelta(days=30)   # keep the risk gate's window clock-proof
     book = {"bids": [{"px": {"value": "0.5360"}, "qty": "460"}, {"px": {"value": "0.5330"}, "qty": "232"}],
             "offers": [{"px": {"value": "0.5370"}, "qty": "7429"}, {"px": {"value": "0.5380"}, "qty": "49"}]}
     long_b, short_b = books_from_us(m.slug, book)

@@ -37,7 +37,7 @@ def get_logger(name: str) -> KV:
     return KV(logging.getLogger(name), {})
 
 
-def setup(level: str = "INFO", log_dir: str | Path = "data") -> None:
+def setup(level: str = "INFO", log_dir: str | Path = "data", log_name: str = "pm.log") -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s %(message)s", "%H:%M:%S")
     root = logging.getLogger()
     root.setLevel(level)
@@ -48,7 +48,8 @@ def setup(level: str = "INFO", log_dir: str | Path = "data") -> None:
     root.addHandler(console)
 
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    fh = RotatingFileHandler(Path(log_dir) / "pm.log", maxBytes=20_000_000, backupCount=5, encoding="utf-8")
+    # One file per process/venue: two processes sharing one rotating file fail to roll it over on Windows.
+    fh = RotatingFileHandler(Path(log_dir) / log_name, maxBytes=20_000_000, backupCount=5, encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s %(message)s"))
     root.addHandler(fh)
 
