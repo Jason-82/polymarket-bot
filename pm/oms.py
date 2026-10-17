@@ -25,10 +25,11 @@ log = get_logger(__name__)
 
 
 class OMS:
-    def __init__(self, exchange: Exchange, cfg: ExecutionConfig, store: Store):
+    def __init__(self, exchange: Exchange, cfg: ExecutionConfig, store: Store, clock=time.time):
         self.x = exchange
         self.cfg = cfg
         self.store = store
+        self._clock = clock          # the backtest passes replay time; cooldowns must not use the wall clock
         self._last_replace: dict[str, float] = {}
         self._last_taker: dict[str, float] = {}
         self.placed = 0
@@ -36,7 +37,7 @@ class OMS:
         self.rejected = 0
 
     async def sync(self, intents: list[Intent]) -> None:
-        now = time.time()
+        now = self._clock()
         open_orders = await self.x.open_orders()
         by_tag: dict[str, Order] = {o.tag: o for o in open_orders}
         desired = {i.tag: i for i in intents if i.tif is TimeInForce.GTC}

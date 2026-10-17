@@ -48,6 +48,7 @@ class ExecutionConfig:
     min_seconds_between_requotes: float = 3.0
     taker_retry_seconds: float = 5.0              # cooldown before re-firing the same taker tag
     paper_starting_cash_usd: Decimal = Decimal("300")
+    paper_resume: bool = True                     # rebuild the paper portfolio from the tape's fills on restart
     fill_poll_seconds: float = 2.0                # live: order-status poll cadence without the user feed
     reconcile_seconds: float = 20.0               # live: poll cadence while the user feed is connected
     size_change_band: Decimal = Decimal("0.25")   # replace a resting order only if size differs by more than this fraction

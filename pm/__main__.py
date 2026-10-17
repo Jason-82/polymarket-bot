@@ -336,19 +336,8 @@ def _status(cfg: Config, since_hours: float = 0.0, db: str | None = None) -> int
         s.close()
     mk = summary.pop("markouts", None)
     print(json.dumps(summary, indent=2, default=str))
-    if mk and mk.get("fills_measured"):
-        hz = mk["horizons_s"]
-        print(f"\nMarkouts ({mk['units']})")
-        print(f"{'strategy/token':40} {'fills':>5} {'shares':>8} {'capture':>8} " +
-              " ".join(f"{'drift'+str(h)+'s':>9} {'net'+str(h)+'s':>8}" for h in hz))
-        for section, rows in (("by strategy", mk["by_strategy"]), ("worst tokens", mk["worst_tokens"]),
-                              ("best tokens", mk["best_tokens"])):
-            print(f"  -- {section}")
-            for r in rows:
-                cells = " ".join(f"{r[f'drift_{h}s_c']:>9.2f} {r[f'net_{h}s_c']:>8.2f}" for h in hz)
-                print(f"  {r['key'][:38]:38} {r['fills']:>5} {r['shares']:>8} {r['capture_c']:>8.2f} {cells}")
-    elif mk is not None:
-        print("\nMarkouts: no fills measured yet.")
+    from .backtest import print_markouts
+    print_markouts(mk)
     return 0
 
 

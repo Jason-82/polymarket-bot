@@ -7,6 +7,7 @@ is counted at full notional.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -116,21 +117,33 @@ class RiskGate:
                         continue
 
                 cid = m.condition_id
-                mkt_exposure = ctx.position_cost(cid) + ctx.resting_notional(cid) + per_market_delta.get(cid, ZERO) + delta
-                if mkt_exposure > self.cfg.max_notional_per_market_usd:
-                    rep.rejected.append((it, f"per-market cap {self.cfg.max_notional_per_market_usd} (would be {mkt_exposure:.2f})"))
-                    continue
 
-                total = total_position + total_resting + accepted_delta_total + delta
-                if total > self.cfg.max_total_notional_usd:
-                    rep.rejected.append((it, f"total cap {self.cfg.max_total_notional_usd} (would be {total:.2f})"))
-                    continue
+                def cap_reason(d: Decimal) -> str:
+                    mkt_exposure = (ctx.position_cost(cid) + ctx.resting_notional(cid)
+                                    + per_market_delta.get(cid, ZERO) + d)
+                    if mkt_exposure > self.cfg.max_notional_per_market_usd:
+                        return f"per-market cap {self.cfg.max_notional_per_market_usd} (would be {mkt_exposure:.2f})"
+                    total = total_position + total_resting + accepted_delta_total + d
+                    if total > self.cfg.max_total_notional_usd:
+                        return f"total cap {self.cfg.max_total_notional_usd} (would be {total:.2f})"
+                    if self.mode is not Mode.READ_ONLY:
+                        free = ctx.portfolio.cash - resting_bids - accepted_delta_total - d
+                        if free < self.cfg.min_cash_reserve_usd:
+                            return f"cash reserve {self.cfg.min_cash_reserve_usd} (free would be {free:.2f})"
+                    return ""
 
-                if self.mode is not Mode.READ_ONLY:
-                    free = ctx.portfolio.cash - resting_bids - accepted_delta_total - delta
-                    if free < self.cfg.min_cash_reserve_usd:
-                        rep.rejected.append((it, f"cash reserve {self.cfg.min_cash_reserve_usd} (free would be {free:.2f})"))
+                why = cap_reason(delta)
+                if why:
+                    # A requote that no longer fits used to cancel the resting order outright, and the next tick
+                    # often re-placed it: flapping. If the resting order is no riskier than the requote (same or
+                    # lower bid, same or smaller size) and still fits as it stands, keep it unchanged instead.
+                    if (existing is not None and existing.side is Side.BUY and existing.price <= it.price
+                            and existing.size <= it.size and not cap_reason(ZERO)):
+                        rep.accepted.append(dataclasses.replace(it, price=existing.price, size=existing.size,
+                                                                reason=f"held: {why}"))
                         continue
+                    rep.rejected.append((it, why))
+                    continue
 
             if is_new and len(ctx.open_orders) + accepted_new_orders >= self.cfg.max_open_orders:
                 rep.rejected.append((it, f"max open orders {self.cfg.max_open_orders}"))

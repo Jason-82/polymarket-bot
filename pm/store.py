@@ -9,7 +9,33 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
-from .models import Book, Fill, Market, Side
+from datetime import datetime
+
+from .models import D, Book, Fill, Market, Side, Token
+
+
+def market_from_json(row: dict[str, Any]) -> Market:
+    """Inverse of Store.market(). Tapes written before a field existed get a safe default; for Polymarket US
+    tapes that predate `synthetic_no`, it is inferred from the |L / |S token naming."""
+    tokens = [Token(t["token_id"], t["outcome"]) for t in row["tokens"]]
+    synthetic = row.get("synthetic_no")
+    if synthetic is None:
+        ids = [t.token_id for t in tokens]
+        synthetic = len(ids) == 2 and ids[0].endswith("|L") and ids[1].endswith("|S")
+    return Market(
+        condition_id=row["condition_id"], question=row.get("question", ""), slug=row.get("slug", ""),
+        tokens=tokens,
+        neg_risk=row.get("neg_risk", False), neg_risk_augmented=row.get("neg_risk_augmented", False),
+        event_id=row.get("event_id", ""), event_market_count=row.get("event_market_count", 0),
+        tick_size=D(row.get("tick_size", "0.01")), min_order_size=D(row.get("min_order_size", "5")),
+        fee_rate=D(row.get("fee_rate", 0)), fee_exponent=D(row.get("fee_exponent", 1)),
+        fee_known=row.get("fee_known", False), maker_rebate_rate=D(row.get("maker_rebate_rate", 0)),
+        end_date=datetime.fromisoformat(row["end_date"]) if row.get("end_date") else None,
+        liquidity_usd=D(row.get("liquidity_usd", 0)), volume_24h_usd=D(row.get("volume_24h_usd", 0)),
+        tags=row.get("tags", []), synthetic_no=bool(synthetic),
+        reward_rate_per_day=D(row.get("reward_rate_per_day", 0)), reward_max_spread=D(row.get("reward_max_spread", 0)),
+        reward_min_size=D(row.get("reward_min_size", 0)),
+    )
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (
@@ -48,6 +74,7 @@ class Store:
         self._buf: list[tuple[str, tuple]] = []
         self._last_book_ts: dict[str, float] = {}
         self._last_book_key: dict[str, tuple] = {}
+        self._pending_books: dict[str, tuple[tuple, tuple]] = {}
         self._snap_interval = book_snapshot_interval
         self._heartbeat = book_heartbeat
         self._last_intent: dict[str, tuple[tuple, float]] = {}
@@ -61,6 +88,7 @@ class Store:
             self.flush()
 
     def flush(self) -> None:
+        self._drain_pending_books()
         if not self._buf:
             return
         buf, self._buf = self._buf, []
@@ -90,30 +118,45 @@ class Store:
             "liquidity_usd": str(m.liquidity_usd), "volume_24h_usd": str(m.volume_24h_usd), "tags": m.tags,
             "reward_rate_per_day": str(m.reward_rate_per_day), "reward_max_spread": str(m.reward_max_spread),
             "reward_min_size": str(m.reward_min_size),
+            "synthetic_no": m.synthetic_no, "maker_rebate_rate": str(m.maker_rebate_rate),
         }
         self._q(
             "INSERT OR REPLACE INTO markets(condition_id, question, slug, json, updated_ts) VALUES (?,?,?,?,?)",
             (m.condition_id, m.question, m.slug, json.dumps(payload), time.time()),
         )
 
+    _BOOK_SQL = "INSERT INTO books(ts, token_id, best_bid, best_ask, bid_sz, ask_sz, top) VALUES (?,?,?,?,?,?,?)"
+
     def book(self, b: Book, force: bool = False) -> None:
-        """Snapshot on top-of-book change (rate-limited), plus a heartbeat row every 10s."""
+        """Snapshot on top-of-book change (rate-limited), plus a heartbeat row every 10s.
+
+        A change that arrives inside the rate-limit window is not dropped: the latest one is kept as pending
+        and written at the next flush (with its own timestamp), unless a later write supersedes it. Without
+        this, the tape could miss the final state of a burst, and markouts would read a stale midpoint.
+        """
         now = time.time()
         key = (b.best_bid, b.best_ask, b.bid_size_at_touch, b.ask_size_at_touch)
         last_ts = self._last_book_ts.get(b.token_id, 0.0)
+        params = (now, b.token_id, _s(b.best_bid), _s(b.best_ask), str(b.bid_size_at_touch),
+                  str(b.ask_size_at_touch), json.dumps(b.top(5)))
         if not force:
             unchanged = self._last_book_key.get(b.token_id) == key
             if unchanged and now - last_ts < self._heartbeat:
                 return
             if not unchanged and now - last_ts < self._snap_interval:
+                self._pending_books[b.token_id] = (key, params)
                 return
+        self._pending_books.pop(b.token_id, None)
         self._last_book_ts[b.token_id] = now
         self._last_book_key[b.token_id] = key
-        self._q(
-            "INSERT INTO books(ts, token_id, best_bid, best_ask, bid_sz, ask_sz, top) VALUES (?,?,?,?,?,?,?)",
-            (now, b.token_id, _s(b.best_bid), _s(b.best_ask), str(b.bid_size_at_touch), str(b.ask_size_at_touch),
-             json.dumps(b.top(5))),
-        )
+        self._q(self._BOOK_SQL, params)
+
+    def _drain_pending_books(self) -> None:
+        pending, self._pending_books = self._pending_books, {}
+        for token_id, (key, params) in pending.items():
+            self._last_book_ts[token_id] = params[0]
+            self._last_book_key[token_id] = key
+            self._buf.append((self._BOOK_SQL, params))
 
     def trade(self, token_id: str, price: Decimal, size: Decimal, side: Side, ts: float) -> None:
         self._q("INSERT INTO trades(ts, token_id, price, size, side) VALUES (?,?,?,?,?)",
@@ -165,31 +208,66 @@ class Store:
         self.flush()
         return self._db.execute(sql, params).fetchall()
 
-    def mid_at(self, token_id: str, ts: float, before: float = 5.0, after: float = 15.0) -> Optional[Decimal]:
-        """Midpoint from the book snapshot nearest to ts within [ts-before, ts+after]."""
+    # The tape stores a book row on every top-of-book change, so the midpoint at time T is the LAST row at or
+    # before T. "Nearest row" was wrong: it could pick a row from after the fill, and when nothing changed for
+    # a while it found no row at all, which the old code then counted as zero drift.
+    def mid_asof(self, token_id: str, ts: float, max_age: float = 120.0, strictly_before: bool = False
+                 ) -> Optional[tuple[Decimal, float]]:
+        """(midpoint, row ts) from the last book row at or before ts, if not older than max_age."""
+        hi = ts - 0.01 if strictly_before else ts
         row = self._db.execute(
-            "SELECT best_bid, best_ask FROM books WHERE token_id=? AND ts BETWEEN ? AND ? "
-            "AND best_bid IS NOT NULL AND best_ask IS NOT NULL ORDER BY ABS(ts-?) LIMIT 1",
-            (token_id, ts - before, ts + after, ts),
+            "SELECT ts, best_bid, best_ask FROM books WHERE token_id=? AND ts <= ? AND ts >= ? "
+            "AND best_bid IS NOT NULL AND best_ask IS NOT NULL ORDER BY ts DESC LIMIT 1",
+            (token_id, hi, ts - max_age),
         ).fetchone()
         if not row:
             return None
-        return (Decimal(row[0]) + Decimal(row[1])) / 2
+        return (Decimal(row[1]) + Decimal(row[2])) / 2, row[0]
 
-    def markouts(self, horizons: tuple[int, ...] = (30, 300), since_ts: float = 0.0) -> dict[str, Any]:
-        """Post-fill price drift: the adverse-selection measurement.
+    def _recorded_after(self, token_id: str, ts: float) -> bool:
+        """True if the tape kept recording this token around/after ts (so a forward-filled mid is valid)."""
+        return self._db.execute("SELECT 1 FROM books WHERE token_id=? AND ts >= ? LIMIT 1",
+                                (token_id, ts)).fetchone() is not None
 
-        For each fill: capture = sign * (mid_at_fill - price)      (what the spread paid us)
-                       drift_h = sign * (mid_at(t+h) - mid_at_fill) (what the market did next)
-                       net_h   = capture + drift_h
-        sign is +1 for buys, -1 for sells. All in cents per share, share-weighted.
-        A persistently negative drift means we are being picked off in that market.
-        """
+    def mid_at(self, token_id: str, ts: float, before: float = 5.0, after: float = 15.0) -> Optional[Decimal]:
+        """Back-compat helper: midpoint as of ts (last row at or before it)."""
+        r = self.mid_asof(token_id, ts, max_age=max(before, 120.0))
+        return r[0] if r else None
+
+    def fills_rows(self, since_ts: float = 0.0) -> list[tuple]:
         self.flush()
-        rows = self._db.execute(
+        return self._db.execute(
             "SELECT ts, strategy, token_id, side, price, size, maker FROM fills WHERE ts >= ? ORDER BY ts",
             (since_ts,),
         ).fetchall()
+
+    def load_fills(self) -> list[Fill]:
+        self.flush()
+        rows = self._db.execute(
+            "SELECT ts, order_id, tag, strategy, token_id, side, price, size, fee, maker FROM fills ORDER BY ts"
+        ).fetchall()
+        return [Fill(order_id=r[1], tag=r[2], strategy=r[3], token_id=r[4], side=Side(r[5]), price=Decimal(r[6]),
+                     size=Decimal(r[7]), fee=Decimal(r[8]), maker=bool(r[9]), ts=r[0]) for r in rows]
+
+    def load_markets(self) -> list[Market]:
+        self.flush()
+        return [market_from_json(json.loads(r[0])) for r in self._db.execute("SELECT json FROM markets")]
+
+    def markouts(self, horizons: tuple[int, ...] = (30, 300), since_ts: float = 0.0,
+                 fills: Optional[list[tuple]] = None) -> dict[str, Any]:
+        """Post-fill price drift: the adverse-selection measurement.
+
+        For each fill: capture = sign * (mid_before_fill - price)       (what the spread paid us)
+                       drift_h = sign * (mid_asof(t+h) - mid_before_fill) (what the market did next)
+                       net_h   = capture + drift_h
+        sign is +1 for buys, -1 for sells. All in cents per share, share-weighted.
+        A horizon is only measured when the tape kept recording that token until then; otherwise it is
+        reported as not covered (None), never as zero.
+        `fills` (ts, strategy, token_id, side, price, size, maker) lets the backtest score its own fills
+        against this tape.
+        """
+        self.flush()
+        rows = fills if fills is not None else self.fills_rows(since_ts)
         by_strat: dict[str, dict[str, Any]] = {}
         by_token: dict[str, dict[str, Any]] = {}
 
@@ -198,48 +276,59 @@ class Store:
                                       **{f"drift_{h}": Decimal(0) for h in horizons},
                                       **{f"n_{h}": Decimal(0) for h in horizons}})
 
+        unmeasured = 0
         for ts, strat, tok, side, price, size, maker in rows:
             price, size = Decimal(price), Decimal(size)
             sign = Decimal(1) if side == "BUY" else Decimal(-1)
-            mid0 = self.mid_at(tok, ts)
-            if mid0 is None:
+            ref = self.mid_asof(tok, ts, strictly_before=True)
+            if ref is None:
+                unmeasured += 1
                 continue
+            mid0, _ = ref
             capture = sign * (mid0 - price) * size
             for b in (bucket(by_strat, strat), bucket(by_token, tok)):
                 b["fills"] += 1
                 b["shares"] += size
                 b["capture"] += capture
             for h in horizons:
-                midh = self.mid_at(tok, ts + h, before=2.0, after=max(15.0, h * 0.5))
-                if midh is None:
+                if not self._recorded_after(tok, ts + h - 30):
                     continue
-                drift = sign * (midh - mid0) * size
+                later = self.mid_asof(tok, ts + h, max_age=h + 120.0)
+                if later is None:
+                    continue
+                drift = sign * (later[0] - mid0) * size
                 for b in (bucket(by_strat, strat), bucket(by_token, tok)):
                     b[f"drift_{h}"] += drift
                     b[f"n_{h}"] += size
 
         def finish(key: str, b: dict[str, Any]) -> dict[str, Any]:
             sh = b["shares"] or Decimal(1)
-            out = {"key": key, "fills": b["fills"], "shares": str(b["shares"]),
-                   "capture_c": float(b["capture"] / sh * 100)}
+            cap = b["capture"] / sh * 100
+            out = {"key": key, "fills": b["fills"], "shares": str(b["shares"]), "capture_c": float(cap)}
             for h in horizons:
-                n = b[f"n_{h}"] or Decimal(1)
-                d = b[f"drift_{h}"] / n * 100
-                out[f"drift_{h}s_c"] = float(d)
-                out[f"net_{h}s_c"] = float(b["capture"] / sh * 100 + d)
-                out[f"covered_{h}s"] = str(b[f"n_{h}"])
+                n = b[f"n_{h}"]
+                if n > 0:
+                    d = b[f"drift_{h}"] / n * 100
+                    out[f"drift_{h}s_c"] = float(d)
+                    out[f"net_{h}s_c"] = float(cap + d)
+                else:
+                    out[f"drift_{h}s_c"] = None
+                    out[f"net_{h}s_c"] = None
+                out[f"covered_{h}s"] = str(n)
+                out[f"coverage_{h}s_pct"] = float(n / sh * 100) if b["shares"] else 0.0
             return out
 
         strat_rows = [finish(k, b) for k, b in by_strat.items()]
         tok_rows = [finish(k, b) for k, b in by_token.items()]
         last_h = f"net_{horizons[-1]}s_c"
-        tok_rows.sort(key=lambda r: r[last_h])
+        scored = sorted((r for r in tok_rows if r[last_h] is not None), key=lambda r: r[last_h])
         return {
             "horizons_s": list(horizons),
             "fills_measured": sum(b["fills"] for b in by_strat.values()),
+            "fills_unmeasured": unmeasured,
             "by_strategy": strat_rows,
-            "worst_tokens": tok_rows[:5],
-            "best_tokens": list(reversed(tok_rows[-5:])),
+            "worst_tokens": scored[:5],
+            "best_tokens": list(reversed(scored[-5:])),
             "units": "cents per share, share-weighted; capture = spread earned at fill, drift = mid move after",
         }
 

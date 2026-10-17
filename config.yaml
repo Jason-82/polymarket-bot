@@ -52,6 +52,7 @@ execution:
   size_change_band: 0.25          # replace on size only if it differs by more than 25%
   taker_retry_seconds: 5
   paper_starting_cash_usd: 300
+  paper_resume: true              # on restart, rebuild the paper portfolio from this venue's tape
   fill_poll_seconds: 2            # live: status poll cadence when the user feed is down
   reconcile_seconds: 20           # live: status poll cadence while the user feed is up
 

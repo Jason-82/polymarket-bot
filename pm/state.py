@@ -8,7 +8,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Optional
 
-from .models import ZERO, Book, Fill, Market, Order, Position, Side, utcnow
+from .models import ONE, ZERO, Book, Fill, Market, Order, Position, Side, utcnow
 
 
 @dataclass
@@ -19,6 +19,16 @@ class Portfolio:
     fees_paid: Decimal = ZERO
     day_start_equity: Optional[Decimal] = None
     day_key: str = ""
+    # token -> its mirror token, for venues where YES and NO are two sides of ONE contract (Polymarket US).
+    # Buying one side while holding the other closes the held side instead of opening a second position.
+    mirrors: dict[str, str] = field(default_factory=dict)
+    unbacked_sells: Decimal = ZERO     # sell volume that filled with nothing held (non-mirrored venues): ignored
+
+    def register_mirrors(self, markets) -> None:
+        for m in markets:
+            if getattr(m, "synthetic_no", False) and m.is_binary and m.yes.token_id != m.no.token_id:
+                self.mirrors[m.yes.token_id] = m.no.token_id
+                self.mirrors[m.no.token_id] = m.yes.token_id
 
     def position(self, token_id: str) -> Position:
         return self.positions.setdefault(token_id, Position(token_id))
@@ -28,6 +38,45 @@ class Portfolio:
         return p.shares if p else ZERO
 
     def apply_fill(self, fill: Fill) -> None:
+        opposite = self.mirrors.get(fill.token_id)
+        if fill.side is Side.SELL:
+            held_self = self.shares(fill.token_id)
+            if fill.size > held_self:
+                # A resting ask can fill after the position it was selling was closed some other way. Cash must
+                # only move for shares actually held. On a mirrored venue, selling one side beyond what is held
+                # is buying the other side at 1 - p (it opens the opposite position); elsewhere it is dropped.
+                excess = fill.size - held_self
+                if held_self > ZERO:
+                    self._apply_plain(Fill(order_id=fill.order_id, tag=fill.tag, strategy=fill.strategy,
+                                           token_id=fill.token_id, side=Side.SELL, price=fill.price,
+                                           size=held_self, fee=fill.fee * held_self / fill.size,
+                                           maker=fill.maker, ts=fill.ts))
+                excess_fee = fill.fee * excess / fill.size
+                if opposite:
+                    self._apply_plain(Fill(order_id=fill.order_id, tag=fill.tag, strategy=fill.strategy,
+                                           token_id=opposite, side=Side.BUY, price=ONE - fill.price, size=excess,
+                                           fee=excess_fee, maker=fill.maker, ts=fill.ts))
+                else:
+                    self.unbacked_sells += excess
+                return
+            self._apply_plain(fill)
+            return
+        held = self.shares(opposite) if opposite else ZERO
+        if fill.side is Side.BUY and held > ZERO:
+            # BUY q of one side == SELL (1 - q) of the other side, for the part that closes it.
+            n = min(fill.size, held)
+            close_fee = fill.fee * n / fill.size
+            self._apply_plain(Fill(order_id=fill.order_id, tag=fill.tag, strategy=fill.strategy, token_id=opposite,
+                                   side=Side.SELL, price=ONE - fill.price, size=n, fee=close_fee,
+                                   maker=fill.maker, ts=fill.ts))
+            if fill.size > n:
+                self._apply_plain(Fill(order_id=fill.order_id, tag=fill.tag, strategy=fill.strategy,
+                                       token_id=fill.token_id, side=Side.BUY, price=fill.price, size=fill.size - n,
+                                       fee=fill.fee - close_fee, maker=fill.maker, ts=fill.ts))
+            return
+        self._apply_plain(fill)
+
+    def _apply_plain(self, fill: Fill) -> None:
         realised = self.position(fill.token_id).apply(fill)
         self.realised_pnl += realised
         self.fees_paid += fill.fee
@@ -50,8 +99,8 @@ class Portfolio:
         inv = sum((p.cost for p in self.positions.values()), ZERO)
         return self.cash + inv + self.unrealised(books)
 
-    def roll_day(self, books: dict[str, Book]) -> None:
-        key = utcnow().strftime("%Y-%m-%d")
+    def roll_day(self, books: dict[str, Book], now: Optional[datetime] = None) -> None:
+        key = (now or utcnow()).strftime("%Y-%m-%d")
         if key != self.day_key:
             self.day_key = key
             self.day_start_equity = self.equity(books)

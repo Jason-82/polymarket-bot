@@ -27,18 +27,8 @@ from .store import Store
 from .strategy import build_strategies
 
 
-def market_from_json(row: dict[str, Any]) -> Market:
-    return Market(
-        condition_id=row["condition_id"], question=row.get("question", ""), slug=row.get("slug", ""),
-        tokens=[Token(t["token_id"], t["outcome"]) for t in row["tokens"]],
-        neg_risk=row.get("neg_risk", False), neg_risk_augmented=row.get("neg_risk_augmented", False),
-        event_id=row.get("event_id", ""), event_market_count=row.get("event_market_count", 0),
-        tick_size=D(row.get("tick_size", "0.01")), min_order_size=D(row.get("min_order_size", "5")),
-        fee_rate=D(row.get("fee_rate", 0)), fee_exponent=D(row.get("fee_exponent", 1)), fee_known=row.get("fee_known", False),
-        end_date=datetime.fromisoformat(row["end_date"]) if row.get("end_date") else None,
-        liquidity_usd=D(row.get("liquidity_usd", 0)), volume_24h_usd=D(row.get("volume_24h_usd", 0)),
-        tags=row.get("tags", []),
-    )
+# Kept here for backwards compatibility; the implementation lives with the tape format.
+from .store import market_from_json  # noqa: E402,F401
 
 
 def run_backtest(cfg: Config, since_hours: float = 24.0, tick_seconds: float = 5.0, db: str | None = None) -> int:
@@ -50,27 +40,43 @@ def run_backtest(cfg: Config, since_hours: float = 24.0, tick_seconds: float = 5
     return asyncio.run(_run(cfg, since_hours, tick_seconds, path))
 
 
+class ReplayClock:
+    """The backtest's notion of 'now': the timestamp of the tape event being replayed."""
+
+    def __init__(self, ts: float = 0.0):
+        self.ts = ts
+
+    def __call__(self) -> float:
+        return self.ts
+
+
 async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) -> int:
     tape = Store(path)
     scratch = Store(":memory:")
     try:
-        markets = [market_from_json(json.loads(r[0])) for r in tape.query("SELECT json FROM markets")]
+        markets = tape.load_markets()
         if not markets:
             print("no markets recorded; run `pm run --mode read_only` for a while first")
             return 1
         ms = MarketState()
         ms.set_markets(markets)
 
-        since = time.time() - since_hours * 3600
+        tape_end = tape.query("SELECT MAX(ts) FROM books")[0][0]
+        if tape_end is None:
+            print("no book snapshots in tape")
+            return 1
+        since = tape_end - since_hours * 3600          # window is relative to the END of the tape, not to today
         books = tape.query("SELECT ts, token_id, top FROM books WHERE ts >= ? ORDER BY ts", (since,))
         trades = tape.query("SELECT ts, token_id, price, size, side FROM trades WHERE ts >= ? ORDER BY ts", (since,))
         if not books:
             print("no book snapshots in window")
             return 1
 
+        clock = ReplayClock(books[0][0])
         pf = Portfolio(cash=cfg.execution.paper_starting_cash_usd)
-        px = PaperExchange(ms.market_for, pf.cash)
-        oms = OMS(px, cfg.execution, scratch)
+        pf.register_mirrors(markets)
+        px = PaperExchange(ms.market_for, pf.cash, clock=clock)
+        oms = OMS(px, cfg.execution, scratch, clock=clock)
         risk = RiskGate(cfg.risk, Mode.PAPER)
         strategies = build_strategies(cfg.strategies, cfg.venue)
 
@@ -81,9 +87,11 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
         n_ticks = 0
         for ts, kind, row in events:
             while ts >= next_tick:
+                clock.ts = next_tick
                 await _tick(next_tick, ms, pf, px, oms, risk, strategies)
                 n_ticks += 1
                 next_tick += tick_seconds
+            clock.ts = ts
             if kind == 0:
                 b = _book_from_row(row)
                 ms.update_book(b)
@@ -91,33 +99,61 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
             else:
                 px.on_trade(Trade(token_id=row[1], price=D(row[2]), size=D(row[3]),
                                   side=Side(row[4]), ts=row[0]))
+        clock.ts = next_tick
         await _tick(next_tick, ms, pf, px, oms, risk, strategies)
 
         eq = pf.equity(ms.books)
+        hours = (books[-1][0] - books[0][0]) / 3600
         fills = scratch.query("SELECT strategy, COUNT(*), SUM(CAST(size AS REAL)*CAST(price AS REAL)), SUM(maker) FROM fills GROUP BY strategy")
-        print(f"\nBacktest over {since_hours:.1f}h  ({len(books)} book rows, {len(trades)} trades, {n_ticks} ticks)")
+        n_fills = sum(r[1] for r in fills)
+        print(f"\nBacktest over {hours:.1f}h of tape  ({len(books)} book rows, {len(trades)} trades, {n_ticks} ticks)")
         print(f"  start cash ....... {cfg.execution.paper_starting_cash_usd}")
         print(f"  end equity ....... {eq:.2f}  (cash {pf.cash:.2f}, realised {pf.realised_pnl:.2f}, "
               f"unrealised {pf.unrealised(ms.books):.2f}, fees {pf.fees_paid:.2f})")
-        print(f"  orders placed .... {oms.placed}  cancelled {oms.cancelled}  rejected {oms.rejected}")
+        print(f"  orders placed .... {oms.placed}  cancelled {oms.cancelled}  rejected {oms.rejected}"
+              + (f"  ({oms.placed / n_fills:.0f} orders per fill)" if n_fills else ""))
         for strat, n, notional, makers in fills:
             print(f"  fills[{strat}] .... {n} fills, ${notional:.2f} notional, {makers} maker")
         held = {t: str(p.shares) for t, p in pf.positions.items() if p.shares > ZERO}
         if held:
             print(f"  open inventory ... {held}")
-        print("\nNote: resting fills ignore queue position; treat this as an upper bound.")
+        mk = tape.markouts(fills=scratch.fills_rows())
+        print_markouts(mk)
+        print("\nPaper fills model queue position (we join behind the displayed size) and assume the adverse case")
+        print("when a level vanishes. They are an approximation of what a real order would have received.")
         return 0
     finally:
         tape.close()
         scratch.close()
 
 
+def print_markouts(mk: dict[str, Any]) -> None:
+    if not mk or not mk.get("fills_measured"):
+        print("\nMarkouts: no fills measured.")
+        return
+    hz = mk["horizons_s"]
+    fmt = lambda v, w: f"{v:>{w}.2f}" if v is not None else f"{'n/a':>{w}}"  # noqa: E731
+    print(f"\nMarkouts ({mk['units']})")
+    print(f"{'strategy/token':40} {'fills':>5} {'shares':>9} {'capture':>8} "
+          + " ".join(f"{'drift' + str(h) + 's':>9} {'net' + str(h) + 's':>8} {'cov%':>5}" for h in hz))
+    for section, rows in (("by strategy", mk["by_strategy"]), ("worst tokens", mk["worst_tokens"]),
+                          ("best tokens", mk["best_tokens"])):
+        print(f"  -- {section}")
+        for r in rows:
+            cells = " ".join(f"{fmt(r[f'drift_{h}s_c'], 9)} {fmt(r[f'net_{h}s_c'], 8)} {r[f'coverage_{h}s_pct']:>5.0f}"
+                             for h in hz)
+            print(f"  {r['key'][:38]:38} {r['fills']:>5} {float(r['shares']):>9.1f} {r['capture_c']:>8.2f} {cells}")
+    if mk.get("fills_unmeasured"):
+        print(f"  ({mk['fills_unmeasured']} fills had no book snapshot before them and are not measured)")
+
+
 async def _tick(ts: float, ms, pf, px, oms, risk, strategies) -> None:
-    pf.roll_day(ms.books)
+    now = datetime.fromtimestamp(ts, tz=timezone.utc)
+    pf.roll_day(ms.books, now=now)
     for f in await oms.drain_fills():
         pf.apply_fill(f)
     ctx = Context(
-        now=datetime.fromtimestamp(ts, tz=timezone.utc), now_ts=ts,
+        now=now, now_ts=ts,
         markets=ms.markets, books=ms.books, token_to_market=ms.token_to_market,
         portfolio=pf, open_orders=await px.open_orders(), params={},
     )

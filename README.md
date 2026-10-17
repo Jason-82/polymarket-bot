@@ -139,9 +139,23 @@ negative net belong in `exclude` lists or need a wider spread.
 
 - Taker orders fill by walking the live book, with the venue fee applied.
 - Post-only orders that would cross are rejected, as on the venue.
-- Resting orders fill when a real trade prints at or through their price, or
-  the far side of the book moves through them. **Queue position is ignored**,
-  so paper is an upper bound on maker fills.
+- **Resting orders join the back of the queue.** Trades at our price consume
+  the displayed size ahead of us first. Size that disappears without a trade
+  counts as cancellations spread through the queue. A trade through our price,
+  the far side reaching our price, or our level vanishing while the price moves
+  away fills us completely. That last rule is deliberately pessimistic: it is
+  where adverse selection shows up.
+- Until 2026-10-17 queue position was ignored. On deep books that turned small
+  prints into fills and made the maker look profitable. Tapes recorded before
+  then can be re-scored with the current model:
+  `python -m pm --venue us backtest --db <old tape>`.
+- On Polymarket US, YES and NO are two sides of one contract, so buying one
+  side while holding the other closes the held side, as on the venue.
+- Paper restarts resume from the tape's fills (`execution.paper_resume`). To
+  start a fresh experiment, rename the venue's tape file first.
+- Markouts compare each fill with the midpoint just before it, then with the
+  midpoint 30 s and 300 s later. A horizon the tape did not cover is shown as
+  `n/a`, never as zero; `cov%` says how much was measured.
 
 ## Going live
 

@@ -34,7 +34,7 @@ def test_markouts_measure_capture_and_drift():
     b = mk_book("Y1", "0.40", "0.44")               # mid 0.42
     b.ts = t0
     s._q("INSERT INTO books(ts, token_id, best_bid, best_ask, bid_sz, ask_sz, top) VALUES (?,?,?,?,?,?,?)",
-         (t0, "Y1", "0.40", "0.44", "100", "100", "{}"))
+         (t0 - 1, "Y1", "0.40", "0.44", "100", "100", "{}"))          # the book just BEFORE the fill
     s._q("INSERT INTO books(ts, token_id, best_bid, best_ask, bid_sz, ask_sz, top) VALUES (?,?,?,?,?,?,?)",
          (t0 + 30, "Y1", "0.38", "0.42", "100", "100", "{}"))   # mid 0.40: moved against our buy
     s._q("INSERT INTO books(ts, token_id, best_bid, best_ask, bid_sz, ask_sz, top) VALUES (?,?,?,?,?,?,?)",

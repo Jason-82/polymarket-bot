@@ -48,6 +48,7 @@ class Engine:
         self._feed_down_alerted = False
         self._loss_halt_alerted = False
         self._last_heartbeat = time.time()
+        self._open_orders_count = 0
         self.ticks = 0
 
     # ------------------------------------------------------------------ feed callbacks
@@ -88,12 +89,31 @@ class Engine:
             if bal is not None:
                 self.pf.cash = bal
             await self._sync_positions()
+        elif self.mode is Mode.PAPER and self.cfg.execution.paper_resume:
+            self._resume_paper_portfolio()
         self.pf.roll_day(self.ms.books)
         self.store.event("start", f"venue={self.venue.name} mode={self.mode.value} markets={len(self.ms.markets)}")
         log.info("engine_started", venue=self.venue.name, mode=self.mode.value, markets=len(self.ms.markets),
                  tokens=len(self.ms.token_ids), cash=str(self.pf.cash), alerts=self.alerts.enabled)
         self.alerts.fire(f"pm started: venue={self.venue.name} mode={self.mode.value} "
                          f"markets={len(self.ms.markets)} cash={self.pf.cash:.2f}")
+
+    def _resume_paper_portfolio(self) -> None:
+        """Rebuild the paper portfolio from the fills already on this venue's tape.
+
+        The paper portfolio lives in memory; without this, every restart reset it to the starting cash while
+        the tape kept the old fills, so `status` showed equity 300 next to dozens of fills. Day P&L starts
+        from the rebuilt equity at restart. Start a new experiment with a new tape (rename the old file).
+        """
+        fills = self.store.load_fills()
+        if not fills:
+            return
+        self.pf.register_mirrors(self.store.load_markets())
+        for f in fills:
+            self.pf.apply_fill(f)
+        log.info("paper_portfolio_resumed", fills=len(fills), cash=f"{self.pf.cash:.2f}",
+                 positions=sum(1 for p in self.pf.positions.values() if p.shares > ZERO),
+                 realised=f"{self.pf.realised_pnl:.2f}")
 
     async def _shutdown(self) -> None:
         log.info("engine_stopping")
@@ -215,6 +235,7 @@ class Engine:
             self._loss_halt_alerted = False
 
         open_orders = await self.exchange.open_orders()
+        self._open_orders_count = len(open_orders)
         ctx = build_context(self.ms, self.pf, open_orders, {})
 
         intents = []
@@ -260,6 +281,7 @@ class Engine:
             log.warning("universe_empty")
             return
         self.ms.set_markets(markets)
+        self.pf.register_mirrors(markets)
         for m in markets:
             self.store.market(m)
 
@@ -292,7 +314,7 @@ class Engine:
         eq = self.pf.equity(self.ms.books)
         self.store.equity(
             self.pf.cash, eq, self.pf.realised_pnl, self.pf.unrealised(self.ms.books), self.pf.fees_paid,
-            self.pf.day_pnl(self.ms.books), len(self.oms._last_replace),
+            self.pf.day_pnl(self.ms.books), self._open_orders_count,
             {t: str(p.shares) for t, p in self.pf.positions.items() if p.shares > ZERO},
         )
 
