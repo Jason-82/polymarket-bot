@@ -183,7 +183,8 @@ def test_markout_uses_book_before_fill_and_forward_fills_quiet_periods():
     s = Store(":memory:")
     t0 = 1_000_000.0
     _book_row(s, t0 - 3, "Y1", "0.40", "0.42")          # book we were quoting against (mid 0.41)
-    _book_row(s, t0 + 0.001, "Y1", "0.39", "0.41")      # the update that triggered the fill (mid 0.40)
+    _book_row(s, t0 - 0.002, "Y1", "0.39", "0.41")      # the update that triggered the fill: the engine stores
+                                                        # it a moment BEFORE the paper fill is stamped (mid 0.40)
     _book_row(s, t0 + 400, "Y1", "0.39", "0.41")        # nothing else changed until after both horizons
     s.fill(Fill("o", "t", "maker", "Y1", Side.BUY, D("0.40"), D(10), ts=t0))
     r = s.markouts(horizons=(30, 300))["by_strategy"][0]
@@ -280,4 +281,6 @@ def test_backtest_uses_tape_time_for_window_and_cooldowns(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Backtest over 0.3h of tape" in out
     placed = int(out.split("orders placed .... ")[1].split()[0])
-    assert placed > 4                                                         # requotes happened as the bid moved
+    # The bid steps up 9 times; requotes must follow replay time (17 orders). On wall-clock cooldowns the whole
+    # replay fits inside one 10 s requote interval and only 7 orders are placed.
+    assert placed >= 10
