@@ -687,3 +687,130 @@ def test_fill_times_longer_than_the_market_was_watched_are_not_counted(capsys):
     text = " ".join(out.split())
     assert "when joining the queue within 1h in 0 and within 24h in 0;" in text   # a, b and short all exceed 2 h
     s.close()
+
+
+# ------------------------------------------------------------------ second review: measure
+
+def test_a_glitch_carried_onto_several_rows_is_not_a_restart():
+    s = _tape([_us()], hours=1)
+    vals = [1_000_000 + 30 * (k // 6) for k in range(361)]
+    for k in range(180, 186):
+        vals[k] = 0                                                     # one bad bbo reply rides on 6 rows
+    _counter_market(s, "x", vals)
+    rows, _ = measure_tape(s)
+    r = _one(rows)
+    assert r.counter_restarts == 0 and r.counter_total == pytest.approx(30 * 60)
+    s.close()
+
+
+def test_a_counter_that_stops_arriving_does_not_dilute_the_flow():
+    s = _tape([_us()], hours=10)
+    vals = [6 * k if k <= 360 else None for k in range(3601)]           # 2160/h for the first hour, then nothing
+    _counter_market(s, "x", vals)
+    rows, _ = measure_tape(s)
+    r = _one(rows)
+    assert r.counter_secs == pytest.approx(3600) and r.sell_flow_h + r.buy_flow_h == pytest.approx(2160, rel=0.01)
+    s.close()
+
+
+def test_a_cold_first_reading_is_not_counted_as_volume():
+    s = _tape([_us()], hours=1)
+    vals = [0] + [1_000_000 + 5 * k for k in range(360)]
+    _counter_market(s, "x", vals)
+    rows, info = measure_tape(s)
+    r = _one(rows)
+    assert r.counter_rebased == 1 and r.counter_total == pytest.approx(359 * 5) and info["rebased"] == 1
+    s.close()
+
+
+def test_a_print_rich_market_stays_ranked_when_its_counter_is_coarse():
+    s = _calibrated_tape([_us("c")])
+    counter = 0
+    for k in range(721):
+        t = 10 * k
+        if 300 <= t < 480 and k % 2 == 0:
+            s.trade("c|L", D("0.50"), D(5), Side.SELL, t - 3)
+            s.trade("c|L", D("0.51"), D(5), Side.BUY, t - 2)
+        if t in (360, 420, 480):
+            counter += 30                                               # read once a minute: 3 moves
+        _row(s, t, "c|L", "0.50", "0.51", 100, 100, str(counter))
+    rows, info = measure_tape(s)
+    c = _one(rows, "c|L")
+    assert info["counter_ratio"] is not None and c.bursts >= 5 and c.counter_moves == 3
+    assert c.flow_source == "venue" and c.ranked
+    s.close()
+
+
+def test_improve_times_are_compared_with_the_wide_time_observed(capsys):
+    s = _calibrated_tape([_us("w")], hours=2)
+    counter = 0
+    for k in range(721):
+        t = 10 * k
+        wide = 3600 <= t < 3600 + 720                                   # wide for 12 minutes (10%)
+        if wide and k % 6 == 3:
+            counter += 2
+        _row(s, t, "w|L", "0.50", "0.52" if wide else "0.51", 10000, 10000, str(counter))
+    rows, info = measure_tape(s)
+    w = _one(rows, "w|L")
+    seen_wide = w.hours * w.can_improve
+    assert w.improve_round_trip_h < math.inf
+    assert w.within_observed("improve_round_trip_h") == (w.improve_round_trip_h <= seen_wide)
+    s.close()
+
+
+def test_a_counter_of_dollars_is_flagged(capsys):
+    ms = [_us("a"), _us("b"), _us("c")]
+    s = _tape(ms, hours=2)
+    for slug, px in (("a", "0.20"), ("b", "0.50"), ("c", "0.80")):
+        counter = Decimal(0)
+        for k in range(721):
+            t = 10 * k
+            if k % 6 == 3:
+                s.trade(f"{slug}|L", D(px), D(10), Side.SELL, t - 3)
+                counter += 10 * D(px)                                   # the counter counts dollars
+            bid = str(D(px) - D("0.01"))
+            _row(s, t, f"{slug}|L", bid, px, 100, 100, str(counter))
+    rows, info = measure_tape(s)
+    assert info["counter_dollars"]
+    print_report(rows, info)
+    assert "follows dollars traded" in " ".join(capsys.readouterr().out.split())
+    s.close()
+
+
+def test_a_counter_of_contracts_is_not_flagged():
+    ms = [_us("a"), _us("b")]
+    s = _tape(ms, hours=2)
+    for slug, px in (("a", "0.20"), ("b", "0.80")):
+        counter = 0
+        for k in range(721):
+            t = 10 * k
+            if k % 6 == 3:
+                s.trade(f"{slug}|L", D(px), D(10), Side.SELL, t - 3)
+                counter += 10
+            _row(s, t, f"{slug}|L", str(D(px) - D("0.01")), px, 100, 100, str(counter))
+    rows, info = measure_tape(s)
+    assert info["counter_ratio"] == pytest.approx(1.0, rel=0.02) and not info["counter_dollars"]
+    s.close()
+
+
+def test_the_wide_spread_split_is_pulled_toward_even_too():
+    """6 bursts, 3 a side; the market is wide half the time and only sellers happened to trade while it was."""
+    s = _calibrated_tape([_us("c")])
+    counter = 0
+    plan = {65: "SELL", 125: "SELL", 185: "BUY", 245: "BUY", 305: "BUY", 365: "SELL"}   # row index -> taker
+    for k in range(721):
+        t = 10 * k
+        wide = k >= 360                                                 # wide in the second hour
+        if k in plan:
+            side = Side.SELL if plan[k] == "SELL" else Side.BUY
+            s.trade("c|L", D("0.50"), D(10), side, t - 3)
+            counter += 10
+        if wide and k in (420, 480):                                    # two more sellers while wide
+            s.trade("c|L", D("0.50"), D(10), Side.SELL, t - 3)
+            counter += 10
+        _row(s, t, "c|L", "0.50", "0.52" if wide else "0.51", 100, 100, str(counter))
+    rows, info = measure_tape(s)
+    c = _one(rows, "c|L")
+    assert info["counter_ratio"] is not None and c.side_source == "prints" and c.wide_buy_share == 0
+    assert c.wide_buy_flow_h > 0 and c.improve_round_trip_h < math.inf   # not 'never' from 3 wide bursts
+    s.close()

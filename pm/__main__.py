@@ -377,12 +377,13 @@ def _record(cfg: Config) -> int:
     tape = Path(cfg.db_file)
     lock = _lock(tape.with_name(tape.name + ".lock"))
     if lock is None:
-        print(f"Another recorder is already writing {tape}. Use that one, or stop it (Ctrl+C in its window) first.")
+        print(f"Another recorder is already writing {cfg.db_file}. Use that one, or stop it (Ctrl+C in its window) "
+              f"first.")
         return 2
     sports = "sports included" if "sports" not in {t.lower() for t in r.exclude_tags} else "no sports"
     lines = [f"Recording Polymarket US for `measure`: up to {r.max_markets} of the busiest markets ({sports}), "
              f"nothing is traded.",
-             f"tape: {tape}   (Ctrl+C to stop; leave it running about a day)",
+             f"tape: {cfg.db_file}   (Ctrl+C to stop; leave it running about a day)",
              "Do not run the paper bot at the same time: both share the venue's request limit."]
     s = cfg.secrets
     if not (s.us_key_id and s.us_secret_key):

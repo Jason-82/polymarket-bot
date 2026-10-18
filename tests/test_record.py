@@ -522,3 +522,102 @@ def test_record_without_keys_warns_in_the_banner(monkeypatch, capsys, tmp_path):
     cli._record(cfg)
     assert "WARNING" in seen["banner"] and "no trade prints" in seen["banner"]
     assert "Do not run the paper bot at the same time" in seen["banner"]
+
+
+# ------------------------------------------------------------------ second review
+
+async def test_trade_prints_alone_do_not_count_as_a_delivering_book_stream(monkeypatch):
+    cfg = Config()
+    cfg.venue_us.book_poll_seconds = 0.03
+    cfg.venue_us.volume_poll_seconds = 0
+    cfg.venue_us.ws_max_markets = 1
+
+    async def idle_ws(self):
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(USMarketData, "_ws_loop", idle_ws)
+    fake = _Fake([])
+    md, _ = _feed(cfg, fake, keys=True)
+    md.start(["a", "b"])
+    md.connected = True
+    for _ in range(5):
+        md._on_trade_msg({"trade": {"marketSlug": "a", "price": {"value": "0.5"}, "quantity": "1",
+                                    "taker": {"intent": "ORDER_INTENT_BUY_LONG"}}})
+        await asyncio.sleep(0.04)
+    assert ("book", "a") in fake.calls and not md.stream_fresh("a")
+    await md.stop()
+
+
+async def test_a_rest_book_overtaken_by_a_stream_book_is_dropped():
+    cfg = Config()
+    got = []
+
+    class Slow(_Fake):
+        async def book(self, slug):
+            await asyncio.sleep(0.05)
+            return {"marketData": _book(bid="0.50", ask="0.52")}
+
+    cfg.venue_us.book_poll_seconds = 10
+    cfg.venue_us.volume_poll_seconds = 0
+    md = USMarketData(cfg, Slow([]), got.append, lambda t: None)
+    md.start(["a"])
+    await asyncio.sleep(0.02)                                           # the REST request is out
+    md._on_market_data({"marketData": {"marketSlug": "a", **_book(bid="0.55", ask="0.57")}})
+    await asyncio.sleep(0.1)
+    await md.stop()
+    longs = [b for b in got if b.token_id == "a|L"]
+    assert longs and longs[-1].best_bid == D("0.55")                    # the newer stream book stays
+
+
+async def test_the_not_moving_warning_needs_a_counter_that_never_moved(caplog):
+    import logging
+    cfg = Config()
+    cfg.venue_us.book_poll_seconds = 10
+    cfg.venue_us.volume_poll_seconds = 0.01
+    n = {"v": 0}
+
+    def once():
+        n["v"] += 1
+        return "100" if n["v"] == 1 else "107"                          # moved once, then quiet
+
+    caplog.set_level(logging.INFO)
+    md, _ = _feed(cfg, _Fake([], volume={"a": once}))
+    md.start(["a"])
+    await asyncio.sleep(0.4)
+    await md.stop()
+    assert md._volume_rounds >= 12 and "us_volume_counter_not_moving" not in caplog.text
+    caplog.clear()
+    md, _ = _feed(cfg, _Fake([], volume={"a": "100"}))                  # never moves
+    md.start(["a"])
+    await asyncio.sleep(0.4)
+    await md.stop()
+    assert "us_volume_counter_not_moving" in caplog.text
+
+
+async def test_games_listing_without_start_times_trusts_the_venue_and_warns_when_empty(caplog):
+    import logging
+    cfg = Config()
+    cfg.as_recorder()
+    cfg.record.max_markets = 4
+    games = [{"slug": f"game{k}", "title": f"A{k} vs B{k}", "markets": [_row(f"gm{k}")]} for k in range(2)]
+    futures = [{"slug": f"fut{k}", "title": f"F{k}", "markets": [_row(f"f{k}")]} for k in range(2)]
+    v = _venue(cfg, _Fake(futures, soon=games))
+    assert [m.condition_id for m in await v.select_universe()] == ["gm0", "f0", "gm1", "f1"]
+    caplog.set_level(logging.INFO)
+    late = [{"slug": "late", "startTime": "2020-01-01T00:00:00Z", "markets": [_row("late")]}]
+    v = _venue(cfg, _Fake(futures, soon=late))
+    await v.select_universe()
+    assert "us_soon_events_none_kept" in caplog.text
+
+
+def test_record_banner_prints_the_tape_path_with_forward_slashes(monkeypatch, tmp_path):
+    import pm.__main__ as cli
+    cfg = Config()
+    cfg.venue = "polymarket_us"
+    cfg.as_recorder()
+    cfg.db_path = "data/" + tmp_path.name + "_m_{venue}.sqlite"
+    seen = {}
+    monkeypatch.setattr(cli, "_run", lambda c, banner=None: seen.setdefault("banner", banner) and 0)
+    cli._record(cfg)
+    assert f"tape: data/{tmp_path.name}_m_polymarket_us.sqlite" in seen["banner"]
+    import os
+    os.remove(f"data/{tmp_path.name}_m_polymarket_us.sqlite.lock")

@@ -430,6 +430,7 @@ class USMarketData:
         self._prev_volume: dict[str, Decimal] = {}
         self._volume_rounds = 0
         self._warned_still = False
+        self._ever_moved = False
         self._last_warn: dict[str, float] = {}
 
     # ---- helpers
@@ -576,9 +577,11 @@ class USMarketData:
             async with sem:
                 await self._throttle.wait()
                 try:
+                    asked = time.time()
                     data = await self.client.markets.book(slug)
                     self.messages += 1
-                    self._emit_books(slug, data or {})
+                    if self._last_stream_ts.get(slug, 0.0) < asked:   # a stream book overtook it: it is older
+                        self._emit_books(slug, data or {})
                     return True
                 except Exception as e:
                     last_err[0] = f"{type(e).__name__}: {e}"[:160]
@@ -641,6 +644,7 @@ class USMarketData:
                 found = [(s, v) for s, v, _ in got if v is not None]
                 failed = sum(1 for _, _, ok in got if not ok)
                 moved = sum(1 for s, v in found if s in self._prev_volume and v != self._prev_volume[s])
+                self._ever_moved = self._ever_moved or moved > 0
                 self._prev_volume.update(found)
                 if n <= 3 or n % 60 == 0:                 # the first rounds, then hourly
                     log.info("us_volume_counter", markets=len(slugs), with_counter=len(found), moved=moved,
@@ -653,10 +657,11 @@ class USMarketData:
                 if n == 10 and found and not any(v for v in self._prev_volume.values()) and not self._warned_still:
                     self._warned_still = True
                     log.warning("us_volume_counter_zero", note="the volume counter is 0 on every market")
-                if n >= 10 and found and moved == 0 and not self._warned_still:
+                if n >= 10 and found and not self._ever_moved and not self._warned_still:
                     self._warned_still = True
                     log.warning("us_volume_counter_not_moving",
-                                note=f"no market's volume counter changed in the last round of {len(found)}")
+                                note=f"no market's volume counter has changed since the start ({n} rounds, "
+                                     f"{len(found)} markets)")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -720,8 +725,7 @@ class USMarketData:
             if not slug:
                 return
             self.messages += 1
-            self._last_stream_ts[slug] = time.time()
-            self.last_message_ts = time.time()
+            self.last_message_ts = time.time()      # only book messages prove the book stream delivers
             for t in trades_from_us(slug, payload):
                 self._on_trade(t)
         except Exception as e:
@@ -1158,10 +1162,15 @@ class PolymarketUSVenue:
             except Exception as e:
                 log.warning("us_soon_events_failed", error=str(e)[:200])
                 listed = []
-            for ev in listed:                             # checked here too, in case the venue ignores the filter
-                st = _dt(ev.get("startTime") or ev.get("startDate"))
-                if st is not None and lo <= st.timestamp() <= hi:
+            # checked here too, in case the venue ignores the filter; trusted only if no row says when it starts
+            starts = [_dt(ev.get("startTime") or ev.get("startDate")) for ev in listed]
+            trust = all(st is None for st in starts)
+            for ev, st in zip(listed, starts):
+                if (st is None and trust) or (st is not None and lo <= st.timestamp() <= hi):
                     soon.append(ev)
+            if listed and not soon:
+                log.warning("us_soon_events_none_kept", listed=len(listed),
+                            note="no event starting soon was found; games may be missing from the recording")
         out: list[dict[str, Any]] = []
         have: set[str] = set()
         for k in range(max(len(busiest), len(soon))):

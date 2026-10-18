@@ -27,7 +27,8 @@ One block per book (the mirrored short side of a Polymarket US market is the sam
             fill times shorter or longer. A counter that moved fewer than MIN_PRINTS times is "few", like a few
             prints. A reading below the highest value so far never lowers it (a drop is not counted; with
             MAX_COUNTER_DROPS or more the counter is not used); a restart from zero is accepted only when the
-            next reading confirms it.
+            next different reading rises from it; a stretch's first reading that the next one more than doubles
+            within 2 x CALIB_LAG_S is taken as a bad reading, not as volume.
     book    no trade data: only size that left the best price between snapshots. That counts cancels and misses
             trades refilled between polls, so it is neither an upper nor a lower bound. Not ranked.
 - fill hours for an order of `size`: joining the back of the queue needs queue + size to trade on that side;
@@ -90,6 +91,7 @@ class MarketMeasure:
     side_source: str = ""          # venue rows: "prints" (measured split) or "even" (assumed, not measured)
     sell_share: float = 0.5        # share of printed volume that hit the bid
     split_share: float = 0.5       # the same, pulled toward even when there are few bursts (splits the counter)
+    wide_split_share: float = 0.5  # the same for prints while the spread was 2+ ticks
     wide_sell_share: float = 0.0   # printed volume that hit the bid while the spread was 2+ ticks / all printed
     wide_buy_share: float = 0.0
     improve_bound: bool = False    # one-tick-better flow is a lower bound (counter only): times are at most this
@@ -108,9 +110,11 @@ class MarketMeasure:
     counter_wide_secs: float = 0.0
     counter_drops: int = 0         # readings below the highest value so far that were not a confirmed restart
     counter_restarts: int = 0
+    counter_rebased: int = 0       # a stretch's first reading was far too low and was replaced by the next
     counter_moves: int = 0         # readings that added volume
     calib_counter: float = 0.0
     calib_prints: float = 0.0
+    calib_notional: float = 0.0    # dollars traded in those prints: tells a counter of dollars from one of contracts
     wide_secs: float = 0.0
 
     @property
@@ -124,6 +128,11 @@ class MarketMeasure:
     @property
     def calib_ratio(self) -> Optional[float]:
         return self.calib_counter / self.calib_prints if self.calib_prints > 0 and self.calib_counter > 0 else None
+
+    def within_observed(self, attr: str) -> bool:
+        """A fill time no longer than the market was watched (improve times are in hours of 2+-tick spread)."""
+        seen = self.hours * (self.can_improve if attr == "improve_round_trip_h" else 1.0)
+        return getattr(self, attr) <= seen
 
     @property
     def join_round_trip_h(self) -> float:
@@ -184,7 +193,7 @@ def measure_token(store: Store, market: Market, token_id: str, since_ts: float, 
             for r in store.query(f"SELECT ts, best_bid, best_ask, bid_sz, ask_sz, {tt_col} FROM books "
                                  "WHERE token_id=? AND ts >= ? ORDER BY ts", (token_id, since_ts))]
     out.rows = len(rows)
-    prints = store.query("SELECT ts, side, size FROM trades WHERE token_id=? AND ts >= ? ORDER BY ts",
+    prints = store.query("SELECT ts, side, size, price FROM trades WHERE token_id=? AND ts >= ? ORDER BY ts",
                          (token_id, since_ts))
     streamed = bool(prints)
     gap_limit = STREAM_MAX_GAP_S if streamed else MAX_GAP_S
@@ -201,6 +210,8 @@ def measure_token(store: Store, market: Market, token_id: str, since_ts: float, 
     peak: Optional[Decimal] = None                        # highest reading in this unbroken stretch: the baseline
     pending: Optional[Decimal] = None                     # a reading below half the peak: a restart, if confirmed
     below = False                                         # inside a dip below the peak (one drop per dip)
+    first_ts: Optional[float] = None                      # the stretch's first reading, until the counter first moves
+    hole_s = hole_wide_s = 0.0                            # observed time since the last reading
     bracket_min = 0                                       # narrowest spread since the counter last moved
     counted = 0.0
     stretch = 0
@@ -210,25 +221,33 @@ def measure_token(store: Store, market: Market, token_id: str, since_ts: float, 
         if not observed:
             if peak is not None:
                 stretch += 1
-            peak = pending = None                         # a break: never diff the counter across it
+            peak = pending = first_ts = None              # a break: never diff the counter across it
             below = False
+            hole_s = hole_wide_s = 0.0
             continue
         cb, ca, cbs, cas, ctt = cur[1:]
         nb, na, nbs, nas, ntt = nxt[1:]
         ct = _ticks(cb, ca, tick)
         # volume counter: diff against the highest value seen in this unbroken stretch (holes are skipped over)
         if peak is None and ctt is not None:
-            peak, pending, bracket_min, below = ctt, None, ct, False
+            peak, pending, bracket_min, below, first_ts = ctt, None, ct, False, cur[0]
         if peak is not None:
             bracket_min = min(bracket_min, ct)
-            out.counter_secs += gap
+            hole_s += gap                                 # counted only once a reading follows
             if ct >= 2:
-                out.counter_wide_secs += gap
+                hole_wide_s += gap
             if ntt is not None:
+                out.counter_secs += hole_s
+                out.counter_wide_secs += hole_wide_s
+                hole_s = hole_wide_s = 0.0
                 delta = Decimal(0)
-                if ntt >= peak:                           # back at or above the highest value: count from there
+                if (first_ts is not None and ntt > 2 * peak and nxt[0] - first_ts <= 2 * CALIB_LAG_S):
+                    # the stretch's first reading was far too low (a cold or lagging reply): start from this one
+                    peak, pending, below, first_ts = ntt, None, False, None
+                    out.counter_rebased += 1
+                elif ntt >= peak:                         # back at or above the highest value: count from there
                     delta, peak, pending, below = ntt - peak, ntt, None, False
-                elif pending is not None and pending <= ntt <= peak / 2:   # confirmed: it restarted from zero
+                elif pending is not None and pending < ntt <= peak / 2:   # confirmed: it restarted and rose
                     delta, peak, pending, below = ntt, ntt, None, False
                     out.counter_restarts += 1
                 else:                                     # below the peak: not counted, never lowers the baseline
@@ -237,6 +256,7 @@ def measure_token(store: Store, market: Market, token_id: str, since_ts: float, 
                         below = True
                     pending = ntt if ntt <= peak / 2 else None   # wait for the next reading to believe a restart
                 if delta > 0:
+                    first_ts = None
                     out.counter_moves += 1
                     out.counter_total += float(delta)
                     counted += float(delta)
@@ -274,7 +294,7 @@ def measure_token(store: Store, market: Market, token_id: str, since_ts: float, 
     # prints inside observed time, each tagged with the spread at that moment
     starts = [a for a, _, _ in intervals]
     kept: list[tuple[float, str, float, int]] = []
-    for ts, side, sz in prints:
+    for ts, side, sz, _ in prints:
         i = bisect.bisect_right(starts, ts) - 1
         if i >= 0 and ts <= intervals[i][1]:
             kept.append((ts, side, float(sz), intervals[i][2]))
@@ -313,9 +333,12 @@ def measure_token(store: Store, market: Market, token_id: str, since_ts: float, 
             last_on[side] = ts
         prior = SPLIT_PRIOR_BURSTS * sorted(sizes)[len(sizes) // 2]
         out.split_share = (sold + prior) / (total + 2 * prior) if total + prior > 0 else 0.5
+        w_sold = sum(z for _, s, z, t in kept if s == "SELL" and t >= 2)
+        w_tot = sum(z for _, _, z, t in kept if t >= 2)
+        out.wide_split_share = (w_sold + prior) / (w_tot + 2 * prior) if w_tot + prior > 0 else 0.5
         out.flow_source = "trades" if n >= MIN_PRINTS else "few"
         if counter_pts and n >= MIN_PRINTS and out.counter_drops < MAX_COUNTER_DROPS and not out.counter_restarts:
-            out.calib_counter, out.calib_prints = _calibration(prints, counter_pts)
+            out.calib_counter, out.calib_prints, out.calib_notional = _calibration(prints, counter_pts)
     if out.flow_source == "book":
         out.flow_hours = out.hours
         out.sell_flow_h = dep_bid / out.hours
@@ -323,15 +346,15 @@ def measure_token(store: Store, market: Market, token_id: str, since_ts: float, 
     return out
 
 
-def _calibration(prints: list, counter_pts: list[tuple[float, float, int]]) -> tuple[float, float]:
-    """(counter volume, printed volume) over the runs of prints that the counter brackets.
+def _calibration(prints: list, counter_pts: list[tuple[float, float, int]]) -> tuple[float, float, float]:
+    """(counter volume, printed volume, printed dollars) over the runs of prints that the counter brackets.
 
     Within each unbroken stretch of counter readings, a run is prints no more than CALIB_GAP_S apart. Its
     counter volume runs from the reading at or before its first print to the first reading at least CALIB_LAG_S
     after its last print (the counter shows a trade late), before the next run starts; if the stretch ends
     sooner, to its last reading, and then only prints at least CALIB_LAG_S before that reading count. Time
     without prints (the stream was down, the market was not streamed) is never counted against the prints."""
-    c_sum = p_sum = 0.0
+    c_sum = p_sum = n_sum = 0.0
     by_stretch: dict[int, list[tuple[float, float]]] = {}
     for t, c, k in counter_pts:
         by_stretch.setdefault(k, []).append((t, c))
@@ -352,12 +375,13 @@ def _calibration(prints: list, counter_pts: list[tuple[float, float, int]]) -> t
             if j >= len(times) or times[j] >= limit:
                 j = bisect.bisect_left(times, limit) - 1
             cut = min(p1, times[j] - CALIB_LAG_S) if j >= 0 else -math.inf
-            counted = sum(float(z) for t, _, z in run if t <= cut)
+            counted = sum(float(z) for t, _, z, _ in run if t <= cut)
             if i < 0 or j <= i or counted <= 0:
                 continue
             c_sum += pts[j][1] - pts[i][1]
             p_sum += counted
-    return c_sum, p_sum
+            n_sum += sum(float(z) * float(px) for t, _, z, px in run if t <= cut)
+    return c_sum, p_sum, n_sum
 
 
 def _uses_counter(r: MarketMeasure, counter_ratio: Optional[float], counter_live: bool = True) -> bool:
@@ -375,7 +399,7 @@ def _finalize(r: MarketMeasure, size: float, counter_ratio: Optional[float], cou
         measured = r.bursts >= MIN_PRINTS
         share = r.split_share if measured else 0.5
         r.side_source = "prints" if measured else "even"
-        r.flow_source = "venue" if r.counter_moves >= MIN_PRINTS else "few"
+        r.flow_source = "venue" if r.counter_moves >= MIN_PRINTS or measured else "few"
         r.flow_hours = r.counter_secs / 3600.0
         total = r.counter_total / ratio / r.flow_hours
         r.sell_flow_h, r.buy_flow_h = total * share, total * (1 - share)
@@ -383,8 +407,8 @@ def _finalize(r: MarketMeasure, size: float, counter_ratio: Optional[float], cou
         wide_frac = r.wide_secs / (r.hours * 3600) if r.hours > 0 else 0.0
         if measured:                                      # prints know the spread at each trade
             if wide_frac > 0:
-                r.wide_sell_flow_h = total * r.wide_sell_share / wide_frac
-                r.wide_buy_flow_h = total * r.wide_buy_share / wide_frac
+                w = (r.wide_sell_share + r.wide_buy_share) * total / wide_frac
+                r.wide_sell_flow_h, r.wide_buy_flow_h = w * r.wide_split_share, w * (1 - r.wide_split_share)
         elif r.counter_wide_secs > 0:                     # the counter only for volume it can place: a lower bound
             wide = r.counter_wide / ratio / (r.counter_wide_secs / 3600)
             r.wide_sell_flow_h, r.wide_buy_flow_h = wide * share, wide * (1 - share)
@@ -433,10 +457,16 @@ def measure_tape(store: Store, since_hours: float = 0.0, size: float = 20.0) -> 
     rank = {"trades": 0, "venue": 0, "few": 1, "book": 2}
     rows.sort(key=lambda r: (rank[r.flow_source], r.join_round_trip_h, r.improve_round_trip_h))
     ratios = sorted(r.calib_ratio for r in calib)
+    dollar_ratios = sorted(r.calib_counter / r.calib_notional for r in calib if r.calib_notional > 0)
+    # contracts: counter/prints is the same on every market; dollars: counter/(prints x price) is, and the first
+    # then moves with the price
+    counter_dollars = (len(ratios) >= 2 and len(dollar_ratios) == len(ratios)
+                       and dollar_ratios[-1] / dollar_ratios[0] < 1.1 and ratios[-1] / ratios[0] > 1.2)
     info = {"tape_hours": (end - since_ts) / 3600.0, "up_hours": up_h, "size": size, "dropped": dropped,
             "counter_ratio": ratio, "counter_markets": len(calib),
             "counter_ratios": (ratios[0], ratios[len(ratios) // 2], ratios[-1]) if len(ratios) >= 2 else None,
-            "has_counter_col": has_counter_col, "counter_live": counter_live,
+            "has_counter_col": has_counter_col, "counter_live": counter_live, "counter_dollars": counter_dollars,
+            "rebased": sum(r.counter_rebased for r in rows),
             "with_counter": len(with_counter),
             "with_prints": sum(1 for r in rows if r.prints > 0),
             "drop_markets": sum(1 for r in rows if r.counter_drops > 0),
@@ -509,7 +539,8 @@ def print_report(rows: list[MarketMeasure], info: dict, top: int = 30) -> None:
             print(f"    fill time: no trade data (book churn {_fmt_n(r.sell_flow_h)}/{_fmt_n(r.buy_flow_h)} "
                   f"per h is not trades)")
         else:
-            longer = "  > observed" if r.hours < r.join_round_trip_h < math.inf else ""
+            longer = ("  > observed" if any(getattr(r, a) < math.inf and not r.within_observed(a)
+                                            for a in ("join_round_trip_h", "improve_round_trip_h")) else "")
             bound = "<=" if r.improve_bound and r.improve_round_trip_h < math.inf else ""
             print(f"    fill time  join bid/ask {_h(r.fill_join_bid_h)}/{_h(r.fill_join_ask_h)}   "
                   f"one tick better {bound}{_h(r.fill_improve_bid_h)}/{_h(r.fill_improve_ask_h)}{longer}"[:WIDTH])
@@ -525,7 +556,7 @@ def print_report(rows: list[MarketMeasure], info: dict, top: int = 30) -> None:
     if ranked:
         def count(within: float, attr: str) -> str:
             # a fill time longer than the market was watched is an extrapolation (a game may settle first)
-            hit = [r for r in ranked if getattr(r, attr) <= min(within, r.hours)]
+            hit = [r for r in ranked if getattr(r, attr) <= within and r.within_observed(attr)]
             return f"{len(hit)}{_kinds(hit) if n_sports else ''}"
 
         print(_wrap(f"Markets with measured flow: {len(ranked)}{_kinds(ranked)}. A {size:g}-lot fills on both sides "
@@ -567,7 +598,10 @@ def print_report(rows: list[MarketMeasure], info: dict, top: int = 30) -> None:
         print(_wrap(f"Venue volume counter calibrated against trade prints on {info['counter_markets']} streamed "
                     f"markets: counter = {info['counter_ratio']:.2f} x prints{spread}."
                     + (" The markets disagree by more than 1.5x, so one ratio may not fit all markets."
-                       if rng and rng[0] > 0 and rng[2] / rng[0] > 1.5 else "")))
+                       if rng and rng[0] > 0 and rng[2] / rng[0] > 1.5 else "")
+                    + (" WARNING: the counter follows dollars traded (contracts x price) more closely than "
+                       "contracts, so one ratio does not fit markets at other prices; treat counter flows as rough."
+                       if info.get("counter_dollars") else "")))
     elif info.get("with_counter") and info.get("counter_live", True):
         print(_wrap("The venue volume counter is not calibrated yet: that needs 2 streamed markets with both the "
                     f"counter and {MIN_PRINTS}+ bursts of prints. Until then 1 on the counter is taken as 1 "
@@ -586,7 +620,7 @@ def print_report(rows: list[MarketMeasure], info: dict, top: int = 30) -> None:
 def write_csv(rows: list[MarketMeasure], path: str) -> None:
     cols = ["label", "slug", "token_id", "tick", "sports", "game", "hours", "coverage", "flow_source",
             "side_source", "sell_share", "split_share", "counter_moves", "counter_drops", "counter_restarts",
-            "calib_ratio", "prints", "bursts", "flow_hours",
+            "counter_rebased", "calib_ratio", "prints", "bursts", "flow_hours",
             "sell_flow_h", "buy_flow_h", "bid_depth", "ask_depth", "spread_1", "spread_2", "spread_3plus",
             "median_spread_c", "can_improve", "wide_sell_flow_h", "wide_buy_flow_h", "fill_join_bid_h",
             "fill_join_ask_h", "join_round_trip_h", "fill_improve_bid_h", "fill_improve_ask_h",
