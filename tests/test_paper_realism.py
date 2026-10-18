@@ -161,8 +161,9 @@ def test_portfolio_resume_from_tape(tmp_path):
     m = mk_market("x", "x|L", "x|S")
     m.synthetic_no = True
     s.market(m)
-    s.fill(Fill("a", "t", "maker", "x|L", Side.BUY, D("0.53"), D(20), ts=1.0))
-    s.fill(Fill("b", "t", "maker", "x|S", Side.BUY, D("0.40"), D(5), ts=2.0))
+    s.fill(Fill("paper-a", "t", "maker", "x|L", Side.BUY, D("0.53"), D(20), ts=1.0))
+    s.fill(Fill("paper-b", "t", "maker", "x|S", Side.BUY, D("0.40"), D(5), ts=2.0))
+    s.fill(Fill("0xLIVE", "t", "maker", "x|L", Side.BUY, D("0.50"), D(100), ts=3.0))   # a real fill: not replayed
     s.close()
     eng = Engine(cfg)
     try:
@@ -179,17 +180,25 @@ def _book_row(s, ts, tok, bid, ask):
     s._q(s._BOOK_SQL, (ts, tok, bid, ask, "100", "100", "{}"))
 
 
+def _heartbeat(s, tok, bid, ask, start, end, every=10.0):
+    """What the engine's timer writes for a quiet market while the recorder runs."""
+    t = start
+    while t <= end:
+        _book_row(s, t, tok, bid, ask)
+        t += every
+
+
 def test_markout_uses_book_before_fill_and_forward_fills_quiet_periods():
     s = Store(":memory:")
     t0 = 1_000_000.0
     _book_row(s, t0 - 3, "Y1", "0.40", "0.42")          # book we were quoting against (mid 0.41)
     _book_row(s, t0 - 0.002, "Y1", "0.39", "0.41")      # the update that triggered the fill: the engine stores
                                                         # it a moment BEFORE the paper fill is stamped (mid 0.40)
-    _book_row(s, t0 + 400, "Y1", "0.39", "0.41")        # nothing else changed until after both horizons
+    _heartbeat(s, "Y1", "0.39", "0.41", t0 + 10, t0 + 600)   # quiet afterwards, recorder running
     s.fill(Fill("o", "t", "maker", "Y1", Side.BUY, D("0.40"), D(10), ts=t0))
     r = s.markouts(horizons=(30, 300))["by_strategy"][0]
     assert r["capture_c"] == pytest.approx(1.0)          # vs the PRE-fill mid
-    assert r["drift_30s_c"] == pytest.approx(-1.0)       # forward-filled from the trigger row
+    assert r["drift_30s_c"] == pytest.approx(-1.0)
     assert r["drift_300s_c"] == pytest.approx(-1.0) and r["coverage_300s_pct"] == pytest.approx(100.0)
     s.close()
 
@@ -198,10 +207,33 @@ def test_markout_reports_uncovered_horizons_as_none_not_zero():
     s = Store(":memory:")
     t0 = 1_000_000.0
     _book_row(s, t0 - 3, "Y1", "0.40", "0.42")
-    _book_row(s, t0 + 5, "Y1", "0.40", "0.42")          # then the token stops being recorded
+    _heartbeat(s, "Y1", "0.40", "0.42", t0 + 5, t0 + 60)     # then the token stops being recorded...
+    _heartbeat(s, "Z9", "0.20", "0.22", t0 - 3, t0 + 900)    # ...although the recorder keeps running
     s.fill(Fill("o", "t", "maker", "Y1", Side.BUY, D("0.40"), D(10), ts=t0))
     r = s.markouts(horizons=(30, 300))["by_strategy"][0]
+    assert r["drift_30s_c"] == pytest.approx(0.0) and r["coverage_30s_pct"] == pytest.approx(100.0)
     assert r["drift_300s_c"] is None and r["net_300s_c"] is None and r["coverage_300s_pct"] == 0
+    s.close()
+
+
+def test_markout_treats_a_recorder_restart_as_a_gap():
+    """Stopped right after the fill and restarted 10 minutes later: the old forward-fill must not count."""
+    s = Store(":memory:")
+    t0 = 1_000_000.0
+    _heartbeat(s, "Y1", "0.40", "0.42", t0 - 30, t0 + 5)
+    _heartbeat(s, "Y1", "0.30", "0.32", t0 + 600, t0 + 900)  # after the restart
+    s.fill(Fill("o", "t", "maker", "Y1", Side.BUY, D("0.40"), D(10), ts=t0))
+    r = s.markouts(horizons=(30, 300))["by_strategy"][0]
+    assert r["drift_30s_c"] is None and r["drift_300s_c"] is None
+    s.close()
+
+
+def test_book_flicker_that_reverts_is_not_written():
+    s = Store(":memory:", book_snapshot_interval=60.0)
+    s.book(mk_book("Y1", "0.40", "0.43"))
+    s.book(mk_book("Y1", "0.41", "0.43"))               # pending inside the rate window...
+    s.book(mk_book("Y1", "0.40", "0.43"))               # ...and back to what the tape already shows
+    assert [r[0] for r in s.query("SELECT best_bid FROM books ORDER BY ts")] == ["0.40"]
     s.close()
 
 
@@ -284,3 +316,143 @@ def test_backtest_uses_tape_time_for_window_and_cooldowns(tmp_path, capsys):
     # The bid steps up 9 times; requotes must follow replay time (17 orders). On wall-clock cooldowns the whole
     # replay fits inside one 10 s requote interval and only 7 orders are placed.
     assert placed >= 10
+
+
+# ------------------------------------------------------------------ review round 2 (adversarial review of 709e963)
+
+def _us_market():
+    from pm.venues.polymarket_us import market_from_us
+    return market_from_us({"slug": "s", "title": "S", "outcomes": "[\"Yes\",\"No\"]", "feeCoefficient": 0.06,
+                           "minimumTradeQty": 1, "orderPriceMinTickSize": 0.01, "endDate": "2099-01-01T00:00:00Z",
+                           "active": True}, {"slug": "e", "title": "E", "category": "politics"})
+
+
+def _us_books(bid, ask, bid_sz="100", ask_sz="100"):
+    from pm.venues.polymarket_us import books_from_us
+    return books_from_us("s", {"bids": [{"px": {"value": bid}, "qty": bid_sz}],
+                               "offers": [{"px": {"value": ask}, "qty": ask_sz}]})
+
+
+def _us_print(px_, price, qty, taker_buy):
+    from pm.venues.polymarket_us import trades_from_us
+    for t in trades_from_us("s", {"price": {"value": price}, "quantity": {"value": qty},
+                                  "taker": {"side": "ORDER_SIDE_BUY" if taker_buy else "ORDER_SIDE_SELL"}}):
+        px_.on_trade(t)
+
+
+async def test_mirrored_orders_share_one_real_queue_and_one_print():
+    """SELL |L at 0.51 and BUY |S at 0.49 are both offers at 0.51 on the one US book."""
+    m = _us_market()
+    px = PaperExchange(lambda t: m, D(300))
+    for b in _us_books("0.50", "0.51"):
+        px.on_book(b)
+    await px.place(Intent("maker", "s|L", Side.SELL, D("0.51"), D(10)))
+    await px.place(Intent("maker", "s|S", Side.BUY, D("0.49"), D(20)))
+    _us_print(px, "0.51", "110", taker_buy=True)       # 100 ahead of us, then 10 for us
+    fills = await px.drain_fills()
+    assert sum(f.size for f in fills) == 10            # not 10 + 10 from the same print
+    assert [(f.token_id, f.size) for f in fills] == [("s|L", D(10))]   # time priority: the earlier order
+    _us_print(px, "0.51", "15", taker_buy=True)        # the next 15 go to the |S bid behind it
+    assert [(f.token_id, f.size) for f in await px.drain_fills()] == [("s|S", D(15))]
+
+
+async def test_book_before_trade_is_not_counted_twice():
+    m = mk_market()
+    px = PaperExchange(lambda t: m, D(300))
+    px.on_book(mk_book("Y1", "0.40", "0.45", bid_sz="1000"))
+    o = await px.place(Intent("maker", "Y1", Side.BUY, D("0.40"), D(20)))
+    px.on_book(mk_book("Y1", "0.40", "0.45", bid_sz="400"))         # the book shows a 600 print first...
+    px.on_trade(Trade("Y1", D("0.40"), D(600), Side.SELL, 0.0))     # ...then the print itself arrives
+    assert await px.drain_fills() == [] and px.queue_ahead(o.order_id) == D(400)
+    # same result in the natural order
+    px2 = PaperExchange(lambda t: m, D(300))
+    px2.on_book(mk_book("Y1", "0.40", "0.45", bid_sz="1000"))
+    o2 = await px2.place(Intent("maker", "Y1", Side.BUY, D("0.40"), D(20)))
+    px2.on_trade(Trade("Y1", D("0.40"), D(600), Side.SELL, 0.0))
+    px2.on_book(mk_book("Y1", "0.40", "0.45", bid_sz="400"))
+    assert await px2.drain_fills() == [] and px2.queue_ahead(o2.order_id) == D(400)
+
+
+async def test_empty_and_crossed_snapshots_never_fill():
+    m = mk_market()
+    px = PaperExchange(lambda t: m, D(300))
+    px.on_book(mk_book("Y1", "0.40", "0.45", bid_sz="100", ask_sz="100"))
+    await px.place(Intent("maker", "Y1", Side.BUY, D("0.40"), D(20)))
+    await px.place(Intent("maker", "Y1", Side.SELL, D("0.45"), D(20)))
+    px.on_book(mk_book("Y1", None, None))                            # failed poll / halted
+    px.on_book(mk_book("Y1", "0.46", "0.44"))                        # crossed mid-update snapshot
+    px.on_book(mk_book("Y1", None, "0.45", ask_sz="100"))            # one side missing
+    assert await px.drain_fills() == []
+
+
+async def test_lone_order_is_filled_when_the_levels_behind_it_are_swept():
+    m = mk_market()
+    px = PaperExchange(lambda t: m, D(300))
+    px.on_book(mk_book("Y1", "0.50", "0.54", bid_sz="500"))
+    await px.place(Intent("maker", "Y1", Side.BUY, D("0.51"), D(20)))   # improves: alone at 0.51
+    px.on_book(mk_book("Y1", "0.48", "0.54", bid_sz="500"))              # 0.50 taken out: a seller passed us
+    assert [f.size for f in await px.drain_fills()] == [D(20)]
+
+
+async def test_gtc_taker_remainder_is_not_refilled_from_the_same_liquidity():
+    m = mk_market(fee_rate="0.04")
+    px = PaperExchange(lambda t: m, D(300))
+    px.on_book(mk_book("Y1", "0.49", "0.50", bid_sz="100", ask_sz="10"))
+    o = await px.place(Intent("x", "Y1", Side.BUY, D("0.50"), D(100), post_only=False))
+    px.on_book(mk_book("Y1", "0.49", "0.50", bid_sz="100", ask_sz="10"))
+    fills = await px.drain_fills()
+    assert sum(f.size for f in fills) == D(10) and await px.open_orders() == []
+
+
+async def test_us_paper_fills_are_whole_contracts():
+    m = _us_market()
+    now = [1000.0]
+    px = PaperExchange(lambda t: m, D(300), clock=lambda: now[0])
+    for b in _us_books("0.50", "0.51", bid_sz="7"):
+        px.on_book(b)
+    await px.place(Intent("maker", "s|L", Side.BUY, D("0.50"), D(20)))        # 7 ahead
+    for sz in ("10", "4"):                                               # 3 join behind, then 6 cancel pro rata
+        for b in _us_books("0.50", "0.51", bid_sz=sz):
+            px.on_book(b)                                                # ahead = 7 - 6*7/10 = 2.8
+    now[0] += 30                                                         # a later, separate print
+    _us_print(px, "0.50", "5", taker_buy=False)                          # 2.2 beyond the queue
+    assert [f.size for f in await px.drain_fills()] == [D(2)]            # whole contracts only
+
+
+def test_maker_posts_no_separate_inventory_ask_on_mirrored_venues():
+    from pm.strategy.maker import Maker
+    m = _us_market()
+    pf = Portfolio(cash=D(300))
+    pf.register_mirrors([m])
+    pf.position("s|L").shares, pf.position("s|L").cost = D(20), D(10)
+    params = {"quote_size_shares": 20, "half_spread": 0.01, "min_book_spread": 0.0, "max_book_spread": 0.15,
+              "min_depth_shares_at_touch": 20, "price_band": [0.10, 0.90], "max_inventory_shares": 40,
+              "sell_inventory": True, "join_best": True, "min_half_spread": 0.0, "rewards_first": False}
+    out = Maker(params).on_tick(mk_ctx([m], list(_us_books("0.50", "0.51")), pf=pf))
+    assert all(i.side is Side.BUY for i in out)                         # the |S bid is the unwind
+    assert any(i.token_id == "s|S" for i in out)
+
+
+def test_closing_bid_on_mirror_is_not_charged_as_new_exposure():
+    m = _us_market()
+    pf = Portfolio(cash=D(300))
+    pf.register_mirrors([m])
+    pf.position("s|L").shares, pf.position("s|L").cost = D(80), D(40)  # at the per-market cap
+    close = Intent("maker", "s|S", Side.BUY, D("0.49"), D(20))
+    ctx = mk_ctx([m], list(_us_books("0.50", "0.51")), pf=pf)
+    cfg = RiskConfig(max_notional_per_market_usd=D(40), min_cash_reserve_usd=D(0))
+    assert RiskGate(cfg, Mode.PAPER).evaluate([close], ctx, True).accepted == [close]
+    opener = Intent("maker", "s|L", Side.BUY, D("0.50"), D(20))
+    assert RiskGate(cfg, Mode.PAPER).evaluate([opener], ctx, True).accepted == []
+    pf.day_start_equity = D(1000)                                      # deep in the daily loss limit
+    rep = RiskGate(cfg, Mode.PAPER).evaluate([close, opener], ctx, True)
+    assert rep.accepted == [close]
+
+
+def test_live_excess_sell_does_not_invent_a_position():
+    m = _us_market()
+    pf = Portfolio(cash=D(300), open_mirror_on_excess_sell=False)
+    pf.register_mirrors([m])
+    pf.apply_fill(Fill("v1", "t", "maker", "s|L", Side.SELL, D("0.52"), D(20)))
+    assert pf.positions.get("s|S") is None or pf.shares("s|S") == 0
+    assert pf.unbacked_sells == D(20) and pf.cash == D(300)

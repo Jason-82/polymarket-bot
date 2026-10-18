@@ -263,7 +263,9 @@ async def test_paper_maker_fill_pays_rebate_on_us_market():
     long_b, short_b = books_from_us("fed-cut-sep", BOOK)
     px.on_book(long_b)
     o = await px.place(Intent("maker", "fed-cut-sep|L", Side.BUY, D("0.60"), D(100)))
-    px.on_book(books_from_us("fed-cut-sep", {**BOOK, "offers": [{"px": {"value": "0.59"}, "qty": "100"}]})[0])
+    # sellers come down to 0.59 (through our 0.60 bid); bids fall with them so the snapshot is not crossed
+    px.on_book(books_from_us("fed-cut-sep", {"bids": [{"px": {"value": "0.58"}, "qty": "500"}],
+                                             "offers": [{"px": {"value": "0.59"}, "qty": "100"}]})[0])
     fills = await px.drain_fills()
     assert fills[0].size == D(100) and fills[0].maker
     assert fills[0].fee == -maker_rebate(D("0.60"), D(100), m)      # negative fee = rebate

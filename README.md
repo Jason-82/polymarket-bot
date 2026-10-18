@@ -151,8 +151,18 @@ negative net belong in `exclude` lists or need a wider spread.
   `python -m pm --venue us backtest --db <old tape>`.
 - On Polymarket US, YES and NO are two sides of one contract, so buying one
   side while holding the other closes the held side, as on the venue.
-- Paper restarts resume from the tape's fills (`execution.paper_resume`). To
-  start a fresh experiment, rename the venue's tape file first.
+- Paper restarts resume from the tape's paper fills (`execution.paper_resume`;
+  live fills on the same tape are never replayed into paper). To start a fresh
+  experiment, stop the bot (`Ctrl+C`, wait for `engine_stopped`) and move the
+  tape together with its `-wal`/`-shm` side files into a folder:
+  `mkdir -p data/archive && mv data/pm_polymarket_us.sqlite* data/archive/`.
+  The archived tape can still be re-scored with `backtest --db`.
+- On mirrored venues the maker posts no separate inventory ask: the bid on the
+  other side is the unwind order at that price, and the risk gate charges it
+  only for the part that would open a new position.
+- Simultaneous mirrored orders share one queue in the simulator, a print is
+  counted once even if the book showing it arrives first, and empty or crossed
+  snapshots never fill anything.
 - Markouts compare each fill with the midpoint just before it, then with the
   midpoint 30 s and 300 s later. A horizon the tape did not cover is shown as
   `n/a`, never as zero; `cov%` says how much was measured.

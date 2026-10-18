@@ -81,7 +81,7 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
         strategies = build_strategies(cfg.strategies, cfg.venue)
 
         events: list[tuple[float, int, tuple]] = [(r[0], 0, r) for r in books] + [(r[0], 1, r) for r in trades]
-        events.sort(key=lambda e: (e[0], e[1]))
+        events.sort(key=lambda e: (e[0], -e[1]))     # at equal ts, the print before the book that shows it
 
         next_tick = events[0][0]
         n_ticks = 0
@@ -129,7 +129,8 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
 
 def print_markouts(mk: dict[str, Any]) -> None:
     if not mk or not mk.get("fills_measured"):
-        print("\nMarkouts: no fills measured.")
+        skipped = (mk or {}).get("fills_unmeasured") or 0
+        print("\nMarkouts: no fills measured." + (f" ({skipped} fills had no book snapshot before them.)" if skipped else ""))
         return
     hz = mk["horizons_s"]
     fmt = lambda v, w: f"{v:>{w}.2f}" if v is not None else f"{'n/a':>{w}}"  # noqa: E731

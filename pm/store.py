@@ -142,6 +142,7 @@ class Store:
         if not force:
             unchanged = self._last_book_key.get(b.token_id) == key
             if unchanged and now - last_ts < self._heartbeat:
+                self._pending_books.pop(b.token_id, None)   # it reverted to what the tape already shows
                 return
             if not unchanged and now - last_ts < self._snap_interval:
                 self._pending_books[b.token_id] = (key, params)
@@ -224,10 +225,27 @@ class Store:
             return None
         return (Decimal(row[1]) + Decimal(row[2])) / 2, row[0]
 
-    def _recorded_after(self, token_id: str, ts: float) -> bool:
-        """True if the tape kept recording this token around/after ts (so a forward-filled mid is valid)."""
-        return self._db.execute("SELECT 1 FROM books WHERE token_id=? AND ts >= ? LIMIT 1",
-                                (token_id, ts)).fetchone() is not None
+    ALIVE_GAP_S = 60.0       # the recorder writes a book row at least every ~10 s while it runs (engine heartbeat)
+
+    def _alive_spans(self) -> list[tuple[float, float]]:
+        """Periods the recorder was running: book rows (any token) never more than ALIVE_GAP_S apart."""
+        spans: list[tuple[float, float]] = []
+        for (t,) in self._db.execute("SELECT ts FROM books ORDER BY ts"):
+            if spans and t - spans[-1][1] <= self.ALIVE_GAP_S:
+                spans[-1] = (spans[-1][0], t)
+            else:
+                spans.append((t, t))
+        return spans
+
+    @staticmethod
+    def _within_one_span(spans: list[tuple[float, float]], a: float, b: float) -> bool:
+        import bisect
+        i = bisect.bisect_right(spans, (a, float("inf"))) - 1
+        return i >= 0 and spans[i][0] <= a and b <= spans[i][1]
+
+    def _token_recorded_near(self, token_id: str, lo: float, hi: float) -> bool:
+        return self._db.execute("SELECT 1 FROM books WHERE token_id=? AND ts BETWEEN ? AND ? LIMIT 1",
+                                (token_id, lo, hi)).fetchone() is not None
 
     def mid_at(self, token_id: str, ts: float, before: float = 5.0, after: float = 15.0) -> Optional[Decimal]:
         """Back-compat helper: midpoint as of ts (last row at or before it)."""
@@ -241,10 +259,14 @@ class Store:
             (since_ts,),
         ).fetchall()
 
-    def load_fills(self) -> list[Fill]:
+    def load_fills(self, paper_only: bool = False) -> list[Fill]:
+        """All fills on the tape, oldest first. paper_only keeps simulated fills (order ids 'paper-…'): paper and
+        live share a venue's tape, and a paper restart must not replay real fills."""
         self.flush()
+        where = " WHERE order_id LIKE 'paper-%'" if paper_only else ""
         rows = self._db.execute(
-            "SELECT ts, order_id, tag, strategy, token_id, side, price, size, fee, maker FROM fills ORDER BY ts"
+            "SELECT ts, order_id, tag, strategy, token_id, side, price, size, fee, maker FROM fills" + where
+            + " ORDER BY ts"
         ).fetchall()
         return [Fill(order_id=r[1], tag=r[2], strategy=r[3], token_id=r[4], side=Side(r[5]), price=Decimal(r[6]),
                      size=Decimal(r[7]), fee=Decimal(r[8]), maker=bool(r[9]), ts=r[0]) for r in rows]
@@ -277,6 +299,7 @@ class Store:
                                       **{f"n_{h}": Decimal(0) for h in horizons}})
 
         unmeasured = 0
+        spans = self._alive_spans()
         for ts, strat, tok, side, price, size, maker in rows:
             price, size = Decimal(price), Decimal(size)
             sign = Decimal(1) if side == "BUY" else Decimal(-1)
@@ -291,7 +314,11 @@ class Store:
                 b["shares"] += size
                 b["capture"] += capture
             for h in horizons:
-                if not self._recorded_after(tok, ts + h - 30):
+                # Covered only if the recorder ran without a gap from the fill to t+h, and this token was still being
+                # recorded around t+h (it may have left the universe). Otherwise the forward-filled mid is stale.
+                if not self._within_one_span(spans, ts, ts + h):
+                    continue
+                if not self._token_recorded_near(tok, ts + h / 2, ts + h + 300):
                     continue
                 later = self.mid_asof(tok, ts + h, max_age=h + 120.0)
                 if later is None:

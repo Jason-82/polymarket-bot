@@ -88,6 +88,7 @@ class RiskGate:
         accepted_delta_total = ZERO
         accepted_new_orders = 0
         per_market_delta: dict[str, Decimal] = {}
+        claimed: dict[str, Decimal] = {}     # held mirror shares already claimed by closing BUYs in this pass
 
         for it in intents:
             m = ctx.market_for(it.token_id)
@@ -97,9 +98,18 @@ class RiskGate:
                 continue
 
             existing = open_by_tag.get(it.tag)
-            delta = it.notional - (existing.remaining_notional if existing else ZERO)
+            # On a mirrored venue (Polymarket US) buying one side while holding the other CLOSES the held side: that
+            # part opens no exposure and needs no cash, so only the opening part is charged. Resting orders stay
+            # counted at full notional (conservative); replacing one only charges the difference.
+            mirror = ctx.portfolio.mirrors.get(it.token_id) if it.side is Side.BUY else None
+            closes = ZERO
+            if mirror:
+                closes = max(ZERO, min(it.size, ctx.shares(mirror) - claimed.get(mirror, ZERO)))
+            opens = it.size - closes
+            delta = opens * it.price - (existing.remaining_notional if existing else ZERO)
             is_new = existing is None
-            reduces_risk = it.side is Side.SELL and ctx.shares(it.token_id) >= it.size
+            reduces_risk = ((it.side is Side.SELL and ctx.shares(it.token_id) >= it.size)
+                            or (it.side is Side.BUY and closes > ZERO and opens <= ZERO))
 
             if loss_limited and not reduces_risk:
                 rep.rejected.append((it, f"daily loss limit hit (day_pnl={day_pnl:.2f})"))
@@ -110,7 +120,7 @@ class RiskGate:
                 continue
 
             if it.side is Side.BUY:
-                if it.post_only:
+                if it.post_only and opens > ZERO:
                     secs = m.seconds_to_resolution(ctx.now)
                     if secs is not None and secs < self.cfg.min_hours_to_resolution * 3600:
                         rep.rejected.append((it, "too close to resolution for resting orders"))
@@ -141,6 +151,8 @@ class RiskGate:
                             and existing.size <= it.size and not cap_reason(ZERO)):
                         rep.accepted.append(dataclasses.replace(it, price=existing.price, size=existing.size,
                                                                 reason=f"held: {why}"))
+                        if mirror and closes > ZERO:
+                            claimed[mirror] = claimed.get(mirror, ZERO) + min(closes, existing.size)
                         continue
                     rep.rejected.append((it, why))
                     continue
@@ -154,6 +166,8 @@ class RiskGate:
             if it.side is Side.BUY:
                 accepted_delta_total += delta
                 per_market_delta[m.condition_id] = per_market_delta.get(m.condition_id, ZERO) + delta
+                if mirror and closes > ZERO:
+                    claimed[mirror] = claimed.get(mirror, ZERO) + closes
             if is_new:
                 accepted_new_orders += 1
 

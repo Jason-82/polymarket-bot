@@ -22,7 +22,10 @@ class Portfolio:
     # token -> its mirror token, for venues where YES and NO are two sides of ONE contract (Polymarket US).
     # Buying one side while holding the other closes the held side instead of opening a second position.
     mirrors: dict[str, str] = field(default_factory=dict)
-    unbacked_sells: Decimal = ZERO     # sell volume that filled with nothing held (non-mirrored venues): ignored
+    unbacked_sells: Decimal = ZERO     # sell volume that filled with nothing held and was not booked
+    # Paper: a sell beyond what is held opens the mirror position (what the venue does). Live: positions are synced
+    # from the venue, and a fill the snapshot already contains must not create a phantom position; leave it unbooked.
+    open_mirror_on_excess_sell: bool = True
 
     def register_mirrors(self, markets) -> None:
         for m in markets:
@@ -52,7 +55,7 @@ class Portfolio:
                                            size=held_self, fee=fill.fee * held_self / fill.size,
                                            maker=fill.maker, ts=fill.ts))
                 excess_fee = fill.fee * excess / fill.size
-                if opposite:
+                if opposite and self.open_mirror_on_excess_sell:
                     self._apply_plain(Fill(order_id=fill.order_id, tag=fill.tag, strategy=fill.strategy,
                                            token_id=opposite, side=Side.BUY, price=ONE - fill.price, size=excess,
                                            fee=excess_fee, maker=fill.maker, ts=fill.ts))

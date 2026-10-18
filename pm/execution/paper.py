@@ -26,22 +26,29 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Callable, Optional
 
 from ..feed import Trade
 from ..fees import maker_rebate, taker_fee
 from ..log import get_logger
-from ..models import ZERO, Book, Fill, Intent, Market, Order, OrderStatus, Side, TimeInForce
+from ..models import ONE, ZERO, Book, Fill, Intent, Market, Order, OrderStatus, Side, TimeInForce
 from . import ExchangeError
 
 log = get_logger(__name__)
 
 
+PENDING_WINDOW_S = 2.0   # a print that arrives this soon after the book that already showed it is the same volume
+
+
 @dataclass
 class _Queue:
-    ahead: Decimal        # displayed size in front of us at our price
-    level_seen: Decimal   # displayed size at our price the last time we looked
+    ahead: Decimal                       # displayed size in front of us at our price (excludes our own orders)
+    level_seen: Decimal                  # displayed size at our price the last time we looked
+    worse_seen: Optional[Decimal] = None # best price on our side strictly worse than ours, last time we looked
+    pending_shrink: Decimal = ZERO       # level shrink seen in a book update and not yet matched to a print
+    pending_credit: Decimal = ZERO       # how much `ahead` was reduced (pro rata) for that shrink
+    pending_ts: float = 0.0
 
 
 def level_size(book: Optional[Book], side: Side, price: Decimal) -> Decimal:
@@ -52,6 +59,20 @@ def level_size(book: Optional[Book], side: Side, price: Decimal) -> Decimal:
         if lvl.price == price:
             return lvl.size
     return ZERO
+
+
+def best_worse(book: Book, side: Side, price: Decimal) -> Optional[Decimal]:
+    """Best price on our side strictly worse than `price` (the levels a sweep would reach after us)."""
+    if side is Side.BUY:
+        c = [l.price for l in book.bids if l.price < price]
+        return max(c) if c else None
+    c = [l.price for l in book.asks if l.price > price]
+    return min(c) if c else None
+
+
+def _worse(a: Decimal, b: Decimal, side: Side) -> bool:
+    """Is price `a` worse than `b` for a resting order on `side`?"""
+    return a < b if side is Side.BUY else a > b
 
 
 class PaperExchange:
@@ -74,7 +95,12 @@ class PaperExchange:
 
     # ------------------------------------------------------------------ market data hooks
     def on_book(self, book: Book) -> None:
+        # An empty or crossed snapshot (a failed poll, a halt, a mid-update book) says nothing about where the
+        # market traded. It must neither fill us nor move our place in the queue.
+        if (not book.bids and not book.asks) or book.crossed:
+            return
         self._books[book.token_id] = book
+        now = self._clock()
         for o in list(self._orders.values()):
             if o.token_id != book.token_id or o.status is not OrderStatus.OPEN:
                 continue
@@ -84,39 +110,89 @@ class PaperExchange:
             if opposite is not None and (opposite <= o.price if buy else opposite >= o.price):
                 self._fill_resting(o, o.price, o.remaining)          # the other side reached us
                 continue
-            now_level = level_size(book, o.side, o.price)
             best_same = book.best_bid if buy else book.best_ask
-            moved_away = best_same is None or (best_same < o.price if buy else best_same > o.price)
-            if now_level <= ZERO and moved_away and q.level_seen > ZERO and q.ahead > ZERO:
-                # The orders in front of us vanished and the price moved on: swept (we would have filled) or
-                # pulled (we would now be alone at a stale price). Assume the sweep: the adverse case.
-                self._fill_resting(o, o.price, o.remaining)
-                continue
+            if best_same is None:
+                continue                                             # our side is empty: no evidence either way
+            now_level = level_size(book, o.side, o.price)
+            new_worse = best_worse(book, o.side, o.price)
+            moved_away = _worse(best_same, o.price, o.side)
+            if now_level <= ZERO and moved_away:
+                if q.level_seen > ZERO and q.ahead > ZERO:
+                    # Everyone in front of us vanished and the price moved on: swept (we would have filled) or
+                    # pulled. Assume the sweep: the adverse case.
+                    self._fill_resting(o, o.price, o.remaining)
+                    continue
+                if q.worse_seen is not None and _worse(best_same, q.worse_seen, o.side):
+                    # We are alone at our price and the levels BEHIND us were taken out: a seller (buyer) sweeping
+                    # them would have hit us first.
+                    self._fill_resting(o, o.price, o.remaining)
+                    continue
             shrink = q.level_seen - now_level
             if shrink > ZERO and q.level_seen > ZERO:
-                q.ahead -= shrink * q.ahead / q.level_seen           # unexplained shrink: pro-rata cancels
-            q.ahead = max(ZERO, min(q.ahead, now_level))
+                credit = shrink * q.ahead / q.level_seen             # unexplained shrink: pro-rata cancels
+                q.ahead -= credit
+                if now - q.pending_ts > PENDING_WINDOW_S:
+                    q.pending_shrink, q.pending_credit = ZERO, ZERO
+                q.pending_shrink += shrink                           # ...unless a print for it shows up next
+                q.pending_credit += credit
+                q.pending_ts = now
+            q.ahead = max(ZERO, min(q.ahead, now_level)).quantize(Decimal("0.01"), rounding=ROUND_UP)
             q.level_seen = now_level
+            q.worse_seen = new_worse
+
+    def _real(self, o: Order) -> tuple[str, Side, Decimal]:
+        """The venue queue an order really sits in. On a mirrored venue a short-side order at q is an order on the
+        long book at 1 - q on the opposite side, so it shares a queue with our long-side orders at that price."""
+        m = self._market_for(o.token_id)
+        if m is not None and m.synthetic_no and o.token_id == m.no.token_id and m.yes.token_id != m.no.token_id:
+            return m.yes.token_id, o.side.opposite, ONE - o.price
+        return o.token_id, o.side, o.price
 
     def on_trade(self, trade: Trade) -> None:
-        for o in list(self._orders.values()):
-            if o.token_id != trade.token_id or o.status is not OrderStatus.OPEN:
+        m = self._market_for(trade.token_id)
+        if m is not None and m.synthetic_no and trade.token_id == m.no.token_id and m.yes.token_id != m.no.token_id:
+            return                                                   # mirrored venues: each print once, long copy
+        now = self._clock()
+        at_price: dict[Side, list[Order]] = {}
+        for o in list(self._orders.values()):                       # dict order == placement order
+            if o.status is not OrderStatus.OPEN:
                 continue
-            buy = o.side is Side.BUY
-            through = trade.price < o.price if buy else trade.price > o.price
-            at = trade.price == o.price
-            if through:
+            real_tok, real_side, real_px = self._real(o)
+            if real_tok != trade.token_id:
+                continue
+            buy = real_side is Side.BUY
+            if (trade.price < real_px) if buy else (trade.price > real_px):
                 self._fill_resting(o, o.price, o.remaining)          # traded past our price: level emptied
-                continue
-            if not at:
-                continue
-            q = self._queues.setdefault(o.order_id, _Queue(ZERO, ZERO))
-            used = min(q.ahead, trade.size)
-            q.ahead -= used
-            q.level_seen = max(ZERO, q.level_seen - trade.size)      # the real book shrinks by the whole print
-            beyond = trade.size - used
-            if beyond > ZERO:
-                self._fill_resting(o, o.price, beyond)
+            elif trade.price == real_px:
+                at_price.setdefault(real_side, []).append(o)
+        for orders in at_price.values():
+            size = trade.size
+            own_front = ZERO                                         # our earlier orders in this queue
+            own_filled = ZERO                                        # what they took from this print
+            for o in orders:
+                if o.status is not OrderStatus.OPEN:
+                    continue
+                q = self._queues.setdefault(o.order_id, _Queue(ZERO, ZERO))
+                already = ZERO
+                if q.pending_shrink > ZERO and now - q.pending_ts <= PENDING_WINDOW_S:
+                    # The book already showed (part of) this print and we counted it as cancellations.
+                    # Undo that and count it as trading instead, FIFO.
+                    already = min(size, q.pending_shrink)
+                    undo = q.pending_credit * already / q.pending_shrink
+                    q.ahead += undo
+                    q.pending_shrink -= already
+                    q.pending_credit -= undo
+                elif now - q.pending_ts > PENDING_WINDOW_S:
+                    q.pending_shrink, q.pending_credit = ZERO, ZERO
+                before = o.remaining
+                avail = size - q.ahead - own_front
+                q.ahead -= min(q.ahead, max(ZERO, size - own_filled))
+                q.level_seen = max(ZERO, q.level_seen - (size - already))
+                got = ZERO
+                if avail > ZERO:
+                    got = self._fill_resting(o, o.price, avail)
+                own_front += before
+                own_filled += got
 
     # ------------------------------------------------------------------ exchange API
     async def place(self, intent: Intent) -> Order:
@@ -159,8 +235,9 @@ class PaperExchange:
             side=order.side, price=avg, size=filled, fee=fee, maker=False, ts=self._clock(),
         ))
         if intent.tif is TimeInForce.GTC and filled < intent.size:
-            order.status = OrderStatus.OPEN
-            self._rest(order, book)
+            # The real book still shows the liquidity this order just took (paper orders do not change it), so a
+            # resting remainder would immediately "fill" again against the same size. Cancel it instead.
+            log.info("paper_taker_remainder_cancelled", tag=order.tag, remaining=str(intent.size - filled))
         log.info("paper_taker_fill", tag=order.tag, side=order.side.value, size=str(filled), avg=str(avg), fee=str(fee))
         return order
 
@@ -222,21 +299,26 @@ class PaperExchange:
         """Put an order on the (simulated) book behind everything already displayed at its price."""
         size = level_size(book, order.side, order.price)
         self._orders[order.order_id] = order
-        self._queues[order.order_id] = _Queue(ahead=size, level_seen=size)
+        self._queues[order.order_id] = _Queue(
+            ahead=size, level_seen=size,
+            worse_seen=best_worse(book, order.side, order.price) if book is not None else None)
 
-    def _fill_resting(self, o: Order, price: Decimal, available: Decimal) -> None:
+    def _fill_resting(self, o: Order, price: Decimal, available: Decimal) -> Decimal:
         qty = min(o.remaining, available)
+        m = self._market_for(o.token_id)
+        if m is not None and m.synthetic_no:
+            qty = qty.to_integral_value(rounding=ROUND_DOWN)          # Polymarket US trades whole contracts
         if qty <= ZERO:
-            return
+            return ZERO
         o.filled += qty
         if o.remaining <= ZERO:
             o.status = OrderStatus.FILLED
             self._orders.pop(o.order_id, None)
             self._queues.pop(o.order_id, None)
-        m = self._market_for(o.token_id)
         rebate = maker_rebate(price, qty, m) if m else ZERO
         self._fills.append(Fill(
             order_id=o.order_id, tag=o.tag, strategy=o.strategy, token_id=o.token_id,
             side=o.side, price=price, size=qty, fee=-rebate, maker=True, ts=self._clock(),
         ))
         log.info("paper_maker_fill", tag=o.tag, side=o.side.value, size=str(qty), price=str(price))
+        return qty

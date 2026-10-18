@@ -107,8 +107,10 @@ class Maker:
                 px = self._hold(open_by_tag, m.no.token_id, Side.BUY, px, bn, m)
                 intents.append(self._intent(m.no.token_id, Side.BUY, px, size_n, note))
 
-        # --- Optional asks on inventory we actually hold
-        if self.sell_inventory:
+        # --- Optional asks on inventory we actually hold. Not on mirrored venues (Polymarket US): there the bid on
+        # the other side IS the unwind order at that price (buying NO closes a YES long), so a separate ask would
+        # double our size at one price and a single sweep would flip long into short.
+        if self.sell_inventory and not m.synthetic_no:
             if net > ZERO and inv_yes > ZERO:
                 px = self._ask_px(fair_adj + hs, by, m)
                 sz = min(inv_yes, base_size).quantize(Decimal("1"), rounding=ROUND_DOWN)

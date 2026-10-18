@@ -39,6 +39,8 @@ def test_markouts_measure_capture_and_drift():
          (t0 + 30, "Y1", "0.38", "0.42", "100", "100", "{}"))   # mid 0.40: moved against our buy
     s._q("INSERT INTO books(ts, token_id, best_bid, best_ask, bid_sz, ask_sz, top) VALUES (?,?,?,?,?,?,?)",
          (t0 + 300, "Y1", "0.42", "0.46", "100", "100", "{}"))  # mid 0.44: recovered
+    for k in range(-1, 50):                                     # the recorder's heartbeat on another token
+        s._q(s._BOOK_SQL, (t0 + 10 * k, "HB", "0.1", "0.2", "1", "1", "{}"))
     s.fill(Fill("o1", "maker:Y1:BUY", "maker", "Y1", Side.BUY, D("0.40"), D(10), ts=t0))
     mk = s.markouts(horizons=(30, 300))
     row = mk["by_strategy"][0]

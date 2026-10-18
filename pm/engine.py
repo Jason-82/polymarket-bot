@@ -27,6 +27,7 @@ EQUITY_INTERVAL = 10
 STATS_INTERVAL = 60
 BALANCE_INTERVAL = 30
 POSITIONS_INTERVAL = 60
+BOOK_HEARTBEAT_INTERVAL = 5
 
 
 class Engine:
@@ -34,7 +35,9 @@ class Engine:
         self.cfg = cfg
         self.mode = cfg.mode
         self.ms = MarketState()
-        self.pf = Portfolio(cash=cfg.execution.paper_starting_cash_usd if self.mode is Mode.PAPER else ZERO)
+        self.pf = Portfolio(cash=cfg.execution.paper_starting_cash_usd if self.mode is Mode.PAPER else ZERO,
+                            # live positions come from the venue; never invent an opposite position locally
+                            open_mirror_on_excess_sell=self.mode is not Mode.LIVE)
         self.store = Store(cfg.db_file)
         self.venue: Venue = make_venue(cfg)
         self.strategies: list[Strategy] = build_strategies(cfg.strategies, self.venue.name)
@@ -98,6 +101,16 @@ class Engine:
         self.alerts.fire(f"pm started: venue={self.venue.name} mode={self.mode.value} "
                          f"markets={len(self.ms.markets)} cash={self.pf.cash:.2f}")
 
+    async def _apply_fills(self) -> None:
+        for f in await self.oms.drain_fills():
+            self.pf.apply_fill(f)
+            log.info("fill", strategy=f.strategy, side=f.side.value, token=f.token_id[:24], size=str(f.size),
+                     price=str(f.price), fee=str(f.fee), maker=f.maker)
+            if self.cfg.alerts.on_fills:
+                m = self.ms.market_for(f.token_id)
+                q = (m.question[:50] if m else f.token_id[:24])
+                self.alerts.fire(f"fill {f.strategy} {f.side.value} {f.size}@{f.price} {q}", key=f"fill:{f.order_id}")
+
     def _resume_paper_portfolio(self) -> None:
         """Rebuild the paper portfolio from the fills already on this venue's tape.
 
@@ -105,12 +118,16 @@ class Engine:
         the tape kept the old fills, so `status` showed equity 300 next to dozens of fills. Day P&L starts
         from the rebuilt equity at restart. Start a new experiment with a new tape (rename the old file).
         """
-        fills = self.store.load_fills()
+        fills = self.store.load_fills(paper_only=True)   # never fold live fills into paper
         if not fills:
             return
         self.pf.register_mirrors(self.store.load_markets())
         for f in fills:
             self.pf.apply_fill(f)
+        orphaned = [t for t, p in self.pf.positions.items() if p.shares > ZERO and t not in self.ms.token_to_market]
+        if orphaned:
+            log.warning("paper_positions_outside_universe", count=len(orphaned), tokens=",".join(orphaned[:5]),
+                        note="marked at cost and counted against the caps until their market is selected again")
         log.info("paper_portfolio_resumed", fills=len(fills), cash=f"{self.pf.cash:.2f}",
                  positions=sum(1 for p in self.pf.positions.values() if p.shares > ZERO),
                  realised=f"{self.pf.realised_pnl:.2f}")
@@ -157,6 +174,7 @@ class Engine:
     async def _loop(self) -> None:
         now = time.time()
         last_access = last_universe = last_equity = last_stats = last_balance = last_positions = now
+        last_book_heartbeat = now
         while not self._stop.is_set():
             t0 = time.time()
             try:
@@ -173,11 +191,15 @@ class Engine:
                         self.pf.cash = bal
                     last_balance = t0
                 if self.mode is Mode.LIVE and t0 - last_positions > POSITIONS_INTERVAL:
+                    await self._apply_fills()      # fills the snapshot already includes must not be applied after it
                     await self._sync_positions()
                     last_positions = t0
 
                 await self._tick()
                 self._check_health(t0)
+                if t0 - last_book_heartbeat > BOOK_HEARTBEAT_INTERVAL:
+                    self._book_heartbeat()
+                    last_book_heartbeat = t0
 
                 if t0 - last_equity > EQUITY_INTERVAL:
                     self._snapshot_equity()
@@ -216,14 +238,7 @@ class Engine:
             self.alerts.fire("pm: KILL switch released, resuming", key="kill_off")
 
         # Fills first, so strategies see current inventory.
-        for f in await self.oms.drain_fills():
-            self.pf.apply_fill(f)
-            log.info("fill", strategy=f.strategy, side=f.side.value, token=f.token_id[:24], size=str(f.size),
-                     price=str(f.price), fee=str(f.fee), maker=f.maker)
-            if self.cfg.alerts.on_fills:
-                m = self.ms.market_for(f.token_id)
-                q = (m.question[:50] if m else f.token_id[:24])
-                self.alerts.fire(f"fill {f.strategy} {f.side.value} {f.size}@{f.price} {q}", key=f"fill:{f.order_id}")
+        await self._apply_fills()
 
         day_pnl = self.pf.day_pnl(self.ms.books)
         if day_pnl <= -self.cfg.risk.daily_loss_limit_usd:
@@ -260,6 +275,7 @@ class Engine:
                 await self.oms.cancel_all()
             return
         await self.oms.sync(rep.accepted)
+        self._open_orders_count = len(await self.exchange.open_orders())
 
     # ------------------------------------------------------------------ helpers
     async def _check_access(self) -> None:
@@ -309,6 +325,15 @@ class Engine:
             tid: Position(tid, shares=shares, cost=cost) for tid, (shares, cost) in venue_pos.items() if shares > ZERO
         }
         log.info("positions_synced", count=len(self.pf.positions))
+
+    def _book_heartbeat(self) -> None:
+        """Record unchanged books on a timer, so the tape shows the recorder was watching a quiet market (markout
+        coverage depends on it). Only for books the feed refreshed recently: a dead feed must leave a gap."""
+        if not self.venue.feed_connected:
+            return
+        for b in list(self.ms.books.values()):
+            if b.age() < 120:
+                self.store.book(b)
 
     def _snapshot_equity(self) -> None:
         eq = self.pf.equity(self.ms.books)
