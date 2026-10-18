@@ -54,6 +54,7 @@ class Maker:
         self.join_best = bool(params.get("join_best", False))
         self.min_half_spread = D(params.get("min_half_spread", "0.01"))
         self.max_book_disagreement = D(params.get("max_book_disagreement", "0.02"))
+        self.last_skip: dict[str, str] = {}      # market -> why it was not quoted on the latest tick
 
     def on_tick(self, ctx: Context) -> list[Intent]:
         out: list[Intent] = []
@@ -65,20 +66,34 @@ class Maker:
 
     # ------------------------------------------------------------------ core
     def quote_market(self, ctx: Context, m: Market) -> list[Intent]:
-        by, bn = ctx.book(m.yes.token_id), ctx.book(m.no.token_id)
-        if not self._usable(by, ctx.now_ts) or not self._usable(bn, ctx.now_ts):
+        """Quotes for one market; when there are none, `last_skip[market]` says why (for churn diagnostics)."""
+        why = self._skip_reason(ctx, m)
+        if why:
+            self.last_skip[m.condition_id] = why
             return []
+        self.last_skip.pop(m.condition_id, None)
+        return self._quotes(ctx, m)
 
+    def _skip_reason(self, ctx: Context, m: Market) -> str:
         if m.yes.token_id == m.no.token_id:
-            return []
+            return "yes and no are the same token"
+        by, bn = ctx.book(m.yes.token_id), ctx.book(m.no.token_id)
+        for b in (by, bn):
+            why = self._unusable(b, ctx.now_ts)
+            if why:
+                return why
         # Fair value from both books. They must agree (mid_yes ≈ 1 - mid_no); when they do not, one book
         # is stale or the market is mislabelled, and quoting off the average is how you get picked off.
-        disagreement = abs(by.mid - (ONE - bn.mid))
-        if disagreement > max(self.max_book_disagreement, 2 * m.tick_size):
-            return []
+        if abs(by.mid - (ONE - bn.mid)) > max(self.max_book_disagreement, 2 * m.tick_size):
+            return "yes and no books disagree"
         fair = (by.mid + (ONE - bn.mid)) / 2
         if fair < self.band_lo or fair > self.band_hi:
-            return []
+            return "outside price band"
+        return ""
+
+    def _quotes(self, ctx: Context, m: Market) -> list[Intent]:
+        by, bn = ctx.book(m.yes.token_id), ctx.book(m.no.token_id)
+        fair = (by.mid + (ONE - bn.mid)) / 2
 
         hs, base_size = self._spread_and_size(m)
         inv_yes, inv_no = ctx.shares(m.yes.token_id), ctx.shares(m.no.token_id)
@@ -153,18 +168,26 @@ class Maker:
         return px
 
     def _usable(self, b: Optional[Book], now_ts: float) -> bool:
-        if b is None or b.mid is None:
-            return False
+        return not self._unusable(b, now_ts)
+
+    def _unusable(self, b: Optional[Book], now_ts: float) -> str:
+        """Why a book cannot be quoted against ("" if it can)."""
+        if b is None:
+            return "no book"
+        if b.mid is None:
+            return "book one-sided or empty"
         if b.age(now_ts) > self.stale_after:
-            return False
+            return "book stale"
         sp = b.spread
-        if sp is None or sp <= ZERO or sp > self.max_book_spread:   # sp <= 0: crossed or locked book
-            return False
+        if sp is None or sp <= ZERO:
+            return "book crossed or locked"
+        if sp > self.max_book_spread:
+            return "spread too wide"
         if sp < self.min_book_spread and not self.join_best:
-            return False
+            return "spread too tight"
         if b.bid_size_at_touch < self.min_depth or b.ask_size_at_touch < self.min_depth:
-            return False
-        return True
+            return "too little size at the touch"
+        return ""
 
     def _scaled_size(self, base: Decimal, exposure: Decimal) -> Decimal:
         """Linear shrink from base at 0 exposure to 0 at max_inventory."""

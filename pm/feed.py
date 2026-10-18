@@ -56,6 +56,7 @@ class MarketFeed:
         self.connected = False
         self.messages = 0
         self.last_message_ts = 0.0
+        self.last_alive_ts = 0.0
         self._books: dict[str, Book] = {}
 
     # ---- lifecycle
@@ -76,6 +77,13 @@ class MarketFeed:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
+
+    def streaming_tokens(self, max_silence: float = 30.0) -> set[str]:
+        """Tokens whose books this stream is keeping current right now. The market channel only sends changes,
+        so a book that has not changed is still current as long as the socket answers (it is pinged every 10 s)."""
+        if not self.connected or time.time() - self.last_alive_ts > max_silence:
+            return set()
+        return set(self._tokens)
 
     async def set_tokens(self, token_ids: list[str]) -> None:
         """Change the subscription set; reconnects (the market channel has no unsubscribe)."""
@@ -139,6 +147,7 @@ class MarketFeed:
     def _handle_raw(self, raw: str | bytes) -> None:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", "replace")
+        self.last_alive_ts = time.time()          # any frame, PONG included, proves the stream is current
         if raw == "PONG" or not raw:
             return
         try:

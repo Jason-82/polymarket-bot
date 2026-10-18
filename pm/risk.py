@@ -80,15 +80,43 @@ class RiskGate:
         loss_limited = day_pnl <= -self.cfg.daily_loss_limit_usd
 
         open_by_tag = {o.tag: o for o in ctx.open_orders}
-        total_resting = sum((o.remaining_notional for o in ctx.open_orders), ZERO)
         total_position = sum((p.cost for p in ctx.portfolio.positions.values()), ZERO)
-        # Cash committed to resting bids (paper/live)
-        resting_bids = sum((o.remaining_notional for o in ctx.open_orders if o.side is Side.BUY), ZERO)
+        mirrors = ctx.portfolio.mirrors
+        held_avail: dict[str, Decimal] = {}          # held shares not yet claimed by a closing bid
+
+        def avail(tok: str) -> Decimal:
+            return held_avail.setdefault(tok, ctx.shares(tok))
+
+        # On a mirrored venue (Polymarket US) buying one side while holding the other CLOSES the held side: that part
+        # opens no exposure and needs no cash. Resting orders and new intents must be charged by the SAME rule; when
+        # resting closers were charged in full but new ones were not, every order accepted on one tick put the book
+        # over the cap on the next, the gate rejected them all, and quotes flapped on and off each tick.
+        rest_charge: dict[str, Decimal] = {}
+        rest_claim: dict[str, tuple[str, Decimal]] = {}
+        rest_by_cid: dict[str, Decimal] = {}
+        total_resting = ZERO
+        resting_bids = ZERO                          # cash committed to resting bids
+        for o in sorted(ctx.open_orders, key=lambda o: o.created_ts):   # older orders claim held shares first
+            if o.side is Side.BUY:
+                mir = mirrors.get(o.token_id)
+                c = ZERO
+                if mir:
+                    c = min(o.remaining, avail(mir))
+                    held_avail[mir] -= c
+                    rest_claim[o.tag] = (mir, c)
+                charge = (o.remaining - c) * o.price
+                resting_bids += charge
+            else:
+                charge = o.remaining_notional        # resting sells: counted, conservatively
+            rest_charge[o.tag] = charge
+            total_resting += charge
+            cid_o = ctx.token_to_market.get(o.token_id)
+            if cid_o:
+                rest_by_cid[cid_o] = rest_by_cid.get(cid_o, ZERO) + charge
 
         accepted_delta_total = ZERO
         accepted_new_orders = 0
         per_market_delta: dict[str, Decimal] = {}
-        claimed: dict[str, Decimal] = {}     # held mirror shares already claimed by closing BUYs in this pass
 
         for it in intents:
             m = ctx.market_for(it.token_id)
@@ -98,15 +126,13 @@ class RiskGate:
                 continue
 
             existing = open_by_tag.get(it.tag)
-            # On a mirrored venue (Polymarket US) buying one side while holding the other CLOSES the held side: that
-            # part opens no exposure and needs no cash, so only the opening part is charged. Resting orders stay
-            # counted at full notional (conservative); replacing one only charges the difference.
-            mirror = ctx.portfolio.mirrors.get(it.token_id) if it.side is Side.BUY else None
-            closes = ZERO
-            if mirror:
-                closes = max(ZERO, min(it.size, ctx.shares(mirror) - claimed.get(mirror, ZERO)))
+            if existing is not None and it.tag in rest_claim:
+                mir, c = rest_claim.pop(it.tag)      # this intent replaces that order: its claim is released
+                held_avail[mir] += c
+            mirror = mirrors.get(it.token_id) if it.side is Side.BUY else None
+            closes = min(it.size, avail(mirror)) if mirror else ZERO
             opens = it.size - closes
-            delta = opens * it.price - (existing.remaining_notional if existing else ZERO)
+            delta = opens * it.price - rest_charge.get(it.tag, ZERO)
             is_new = existing is None
             reduces_risk = ((it.side is Side.SELL and ctx.shares(it.token_id) >= it.size)
                             or (it.side is Side.BUY and closes > ZERO and opens <= ZERO))
@@ -129,7 +155,7 @@ class RiskGate:
                 cid = m.condition_id
 
                 def cap_reason(d: Decimal) -> str:
-                    mkt_exposure = (ctx.position_cost(cid) + ctx.resting_notional(cid)
+                    mkt_exposure = (ctx.position_cost(cid) + rest_by_cid.get(cid, ZERO)
                                     + per_market_delta.get(cid, ZERO) + d)
                     if mkt_exposure > self.cfg.max_notional_per_market_usd:
                         return f"per-market cap {self.cfg.max_notional_per_market_usd} (would be {mkt_exposure:.2f})"
@@ -151,8 +177,8 @@ class RiskGate:
                             and existing.size <= it.size and not cap_reason(ZERO)):
                         rep.accepted.append(dataclasses.replace(it, price=existing.price, size=existing.size,
                                                                 reason=f"held: {why}"))
-                        if mirror and closes > ZERO:
-                            claimed[mirror] = claimed.get(mirror, ZERO) + min(closes, existing.size)
+                        if mirror:
+                            held_avail[mirror] = avail(mirror) - min(existing.remaining, avail(mirror))
                         continue
                     rep.rejected.append((it, why))
                     continue
@@ -167,7 +193,7 @@ class RiskGate:
                 accepted_delta_total += delta
                 per_market_delta[m.condition_id] = per_market_delta.get(m.condition_id, ZERO) + delta
                 if mirror and closes > ZERO:
-                    claimed[mirror] = claimed.get(mirror, ZERO) + closes
+                    held_avail[mirror] = avail(mirror) - closes
             if is_new:
                 accepted_new_orders += 1
 

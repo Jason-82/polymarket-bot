@@ -456,3 +456,109 @@ def test_live_excess_sell_does_not_invent_a_position():
     pf.apply_fill(Fill("v1", "t", "maker", "s|L", Side.SELL, D("0.52"), D(20)))
     assert pf.positions.get("s|S") is None or pf.shares("s|S") == 0
     assert pf.unbacked_sells == D(20) and pf.cash == D(300)
+
+
+# ------------------------------------------------------------------ round 3: quote flapping found in the real re-score
+
+def _us_mkts(n):
+    from pm.venues.polymarket_us import market_from_us
+    ev = {"slug": "e", "title": "E", "category": "politics", "endDate": "2099-01-01T00:00:00Z"}
+    return [market_from_us({"slug": f"m{i}", "title": f"m{i}", "outcomes": "[\"Yes\",\"No\"]", "feeCoefficient": 0.06,
+                            "minimumTradeQty": 1, "orderPriceMinTickSize": 0.01, "endDate": "2099-01-01T00:00:00Z",
+                            "active": True}, ev) for i in range(n)]
+
+
+async def test_resting_closers_are_charged_like_new_ones_so_quotes_do_not_flap():
+    """Holding inventory makes the maker post closing bids. When new closers were charged only for the part that
+    opens exposure but resting ones in full, every order accepted on one tick put the book over the total cap on the
+    next: all quotes were cancelled and re-placed on alternate ticks (22,352 orders for 3 fills on the user's tape)."""
+    from datetime import datetime, timezone
+    from pm.state import Context, MarketState
+    from pm.strategy import build_strategies
+    from pm.venues.polymarket_us import books_from_us
+    cfg = Config.load("config.yaml", env_path="/nonexistent/.env")
+    markets = _us_mkts(12)
+    ms = MarketState(); ms.set_markets(markets)
+    pf = Portfolio(cash=D(300)); pf.register_mirrors(markets)
+    for m in markets[:4]:                                              # inventory -> closing bids on the other side
+        pf.position(m.yes.token_id).shares, pf.position(m.yes.token_id).cost = D(20), D(10)
+    now = [1_000_000.0]
+    px = PaperExchange(ms.market_for, pf.cash, clock=lambda: now[0])
+    store = Store(":memory:")
+    oms = OMS(px, cfg.execution, store, clock=lambda: now[0])
+    risk = RiskGate(cfg.risk, Mode.PAPER)
+    strategies = build_strategies(cfg.strategies, "polymarket_us")
+    placed = []
+    for k in range(6):
+        for i, m in enumerate(markets):
+            bid = D("0.30") + D("0.04") * i
+            for b in books_from_us(m.slug, {"bids": [{"px": {"value": str(bid)}, "qty": "5000"}],
+                                            "offers": [{"px": {"value": str(bid + D("0.01"))}, "qty": "5000"}]}, ts=now[0]):
+                ms.update_book(b); px.on_book(b)
+        ctx = Context(now=datetime.fromtimestamp(now[0], tz=timezone.utc), now_ts=now[0], markets=ms.markets,
+                      books=ms.books, token_to_market=ms.token_to_market, portfolio=pf,
+                      open_orders=await px.open_orders(), params={})
+        rep = risk.evaluate([i for s in strategies for i in s.on_tick(ctx)], ctx, True)
+        before = oms.placed
+        await oms.sync(rep.accepted)
+        placed.append(oms.placed - before)
+        now[0] += 5
+    assert placed[0] > 0 and placed[1:] == [0] * 5, placed            # placed once, then left alone
+    assert oms.cancelled == 0
+    store.close()
+
+
+def test_withdrawal_diagnostics_attribute_the_reason():
+    from pm.diagnostics import Withdrawals
+    from pm.strategy.maker import Maker
+    m = mk_market()
+    resting = [Order("o1", "maker:Y1:BUY", "maker", "Y1", Side.BUY, D("0.40"), D(10)),
+               Order("o2", "maker:N1:BUY", "maker", "N1", Side.BUY, D("0.50"), D(10))]
+    mk = Maker({"stale_after_seconds": 15})
+    mk.on_tick(mk_ctx([m], [mk_book("Y1", "0.40", "0.46", ts=1.0), mk_book("N1", "0.54", "0.60")]))
+    w = Withdrawals()
+    w.record(resting, [], [], [mk], lambda t: m)
+    assert w.reasons == {"strategy: book stale": 2}
+    w2 = Withdrawals()
+    w2.record(resting, [], [(Intent("maker", "Y1", Side.BUY, D("0.41"), D(10)), "total cap 200 (would be 201.00)")],
+              [mk], lambda t: m)
+    assert w2.reasons["risk: total cap 200"] == 1
+
+
+def test_a_live_stream_keeps_unchanged_books_current():
+    from pm.feed import MarketFeed
+    f = MarketFeed("wss://x", lambda b: None, lambda t: None)
+    f._tokens = {"T1", "T2"}
+    f.connected = True
+    assert f.streaming_tokens() == set()                               # nothing heard yet
+    f._handle_raw("PONG")                                              # a pong proves the stream is current
+    assert f.streaming_tokens() == {"T1", "T2"}
+    f.connected = False
+    assert f.streaming_tokens() == set()
+
+
+def test_backtest_treats_a_quiet_streamed_book_as_current_until_its_rows_stop():
+    from pm.backtest import _touch_live_books
+    from pm.state import MarketState
+    ms = MarketState()
+    ms.set_markets([mk_market()])
+    b = mk_book("Y1", "0.40", "0.42", ts=100.0)
+    ms.update_book(b)
+    rows = {"Y1": [100.0, 160.0, 1000.0]}                              # quiet 60 s, then a 14-minute gap
+    _touch_live_books(ms, rows, 130.0)
+    assert b.ts == 130.0                                               # unchanged, still watched: current
+    b.ts = 160.0
+    _touch_live_books(ms, rows, 700.0)
+    assert b.ts == 160.0                                               # inside the gap: stale, as it was live
+
+
+def test_requoted_closer_releases_its_old_claim_on_held_shares():
+    m = _us_mkts(1)[0]
+    pf = Portfolio(cash=D(300)); pf.register_mirrors([m])
+    pf.position(m.yes.token_id).shares, pf.position(m.yes.token_id).cost = D(20), D(10)
+    resting = Order("o1", f"maker:{m.no.token_id}:BUY", "maker", m.no.token_id, Side.BUY, D("0.49"), D(20))
+    ctx = mk_ctx([m], list(_us_books("0.50", "0.51")), pf=pf, open_orders=[resting])
+    requote = Intent("maker", m.no.token_id, Side.BUY, D("0.50"), D(20))
+    rep = RiskGate(RiskConfig(max_notional_per_market_usd=D(15), min_cash_reserve_usd=D(0)), Mode.PAPER).evaluate(
+        [requote], ctx, True)
+    assert [(i.price, i.reason) for i in rep.accepted] == [(D("0.50"), "")]   # still a closer: charged nothing

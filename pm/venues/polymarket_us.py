@@ -942,6 +942,13 @@ class PolymarketUSVenue:
         except Exception:
             pass
 
+    def streaming_tokens(self) -> set[str]:
+        """Books on the authenticated market stream are current while it is connected (the SDK's socket keeps
+        itself alive with pings); REST-polled books are refreshed by each poll instead."""
+        if not self.data or not self.data.connected:
+            return set()
+        return {t for slug in self.data._ws_slugs for t in token_ids(slug)}
+
     @property
     def feed_connected(self) -> bool:
         return bool(self.data and (self.data.connected or self.data.messages > 0))

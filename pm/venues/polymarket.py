@@ -72,6 +72,9 @@ class PolymarketVenue:
         await self.gamma.aclose()
         await self.clob.aclose()
 
+    def streaming_tokens(self) -> set[str]:
+        return self.feed.streaming_tokens() if self.feed else set()
+
     @property
     def feed_connected(self) -> bool:
         return bool(self.feed and self.feed.connected)

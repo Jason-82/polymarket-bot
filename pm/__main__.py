@@ -57,7 +57,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run" and args.mode:
         cfg.mode = Mode(args.mode)
     tape = Path(cfg.db_file)
-    setup(cfg.log_level, log_dir=str(tape.parent), log_name=tape.with_suffix(".log").name)
+    if args.cmd in ("backtest", "status"):
+        # Reports: print only the report, and never write into the log file of a bot that may be running.
+        setup("WARNING", log_dir=str(tape.parent), log_name="pm_reports.log")
+    else:
+        setup(cfg.log_level, log_dir=str(tape.parent), log_name=tape.with_suffix(".log").name)
     is_us = cfg.venue == "polymarket_us"
 
     try:

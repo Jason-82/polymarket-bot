@@ -8,6 +8,7 @@ from typing import Optional
 
 from .alerts import Alerts
 from .config import Config
+from .diagnostics import Withdrawals
 from .execution import Exchange
 from .execution.paper import PaperExchange
 from .feed import Trade
@@ -52,6 +53,7 @@ class Engine:
         self._loss_halt_alerted = False
         self._last_heartbeat = time.time()
         self._open_orders_count = 0
+        self.withdrawals = Withdrawals()
         self.ticks = 0
 
     # ------------------------------------------------------------------ feed callbacks
@@ -251,6 +253,11 @@ class Engine:
 
         open_orders = await self.exchange.open_orders()
         self._open_orders_count = len(open_orders)
+        now = time.time()
+        for t in self.venue.streaming_tokens():         # unchanged books on a live stream are current, not stale
+            b = self.ms.books.get(t)
+            if b is not None:
+                b.ts = now
         ctx = build_context(self.ms, self.pf, open_orders, {})
 
         intents = []
@@ -269,6 +276,7 @@ class Engine:
 
         if self.mode is Mode.READ_ONLY:
             return  # strategies and risk run for the record only
+        self.withdrawals.record(open_orders, rep.accepted, rep.rejected, self.strategies, self.ms.market_for)
         if rep.halted:
             if open_orders:
                 log.warning("risk_halt", reason=rep.halt_reason)
@@ -351,5 +359,6 @@ class Engine:
             equity=f"{self.pf.equity(self.ms.books):.2f}", realised=f"{self.pf.realised_pnl:.2f}",
             fees=f"{self.pf.fees_paid:.2f}", placed=self.oms.placed, cancelled=self.oms.cancelled,
             rejected=self.oms.rejected, positions=sum(1 for p in self.pf.positions.values() if p.shares > ZERO),
+            withdrawn=self.withdrawals.total, top_withdraw_reasons=self.withdrawals.summary(),
             access=self.ms.geoblock_country[:40],
         )

@@ -9,6 +9,7 @@ maker strategies and for small taker legs.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import json
 import time
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+from .diagnostics import Withdrawals
 from .execution.paper import PaperExchange
 from .feed import Trade
 from .models import ZERO, Book, D, Level, Market, Mode, Side, Token
@@ -72,7 +74,14 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
             print("no book snapshots in window")
             return 1
 
+        # Liveness from the tape: a streamed market only writes rows when its book changes, so a book counts as
+        # current while the token's NEXT row comes within LIVE_GAP_S (it was still being watched). A token whose rows
+        # stop for longer (feed down, market left the universe) goes stale as it did live.
+        rows_by_token: dict[str, list[float]] = {}
+        for r in books:
+            rows_by_token.setdefault(r[1], []).append(r[0])
         clock = ReplayClock(books[0][0])
+        withdrawals = Withdrawals()
         pf = Portfolio(cash=cfg.execution.paper_starting_cash_usd)
         pf.register_mirrors(markets)
         px = PaperExchange(ms.market_for, pf.cash, clock=clock)
@@ -88,7 +97,8 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
         for ts, kind, row in events:
             while ts >= next_tick:
                 clock.ts = next_tick
-                await _tick(next_tick, ms, pf, px, oms, risk, strategies)
+                _touch_live_books(ms, rows_by_token, next_tick)
+                await _tick(next_tick, ms, pf, px, oms, risk, strategies, withdrawals)
                 n_ticks += 1
                 next_tick += tick_seconds
             clock.ts = ts
@@ -100,7 +110,7 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
                 px.on_trade(Trade(token_id=row[1], price=D(row[2]), size=D(row[3]),
                                   side=Side(row[4]), ts=row[0]))
         clock.ts = next_tick
-        await _tick(next_tick, ms, pf, px, oms, risk, strategies)
+        await _tick(next_tick, ms, pf, px, oms, risk, strategies, withdrawals)
 
         eq = pf.equity(ms.books)
         hours = (books[-1][0] - books[0][0]) / 3600
@@ -117,6 +127,11 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
         held = {t: str(p.shares) for t, p in pf.positions.items() if p.shares > ZERO}
         if held:
             print(f"  open inventory ... {held}")
+        print(f"  quotes withdrawn . {withdrawals.total}" + (f"  (each costs queue position)" if withdrawals.total else ""))
+        for why, k in withdrawals.top(6):
+            print(f"      {k:>7}  {why}")
+        if withdrawals.by_tag:
+            print("    most withdrawn: " + ", ".join(f"{t.split(':', 1)[1][:44]} x{k}" for t, k in withdrawals.by_tag.most_common(3)))
         mk = tape.markouts(fills=scratch.fills_rows())
         print_markouts(mk)
         print("\nPaper fills model queue position (we join behind the displayed size) and assume the adverse case")
@@ -148,7 +163,22 @@ def print_markouts(mk: dict[str, Any]) -> None:
         print(f"  ({mk['fills_unmeasured']} fills had no book snapshot before them and are not measured)")
 
 
-async def _tick(ts: float, ms, pf, px, oms, risk, strategies) -> None:
+LIVE_GAP_S = 300.0
+
+
+def _touch_live_books(ms: MarketState, rows_by_token: dict[str, list[float]], ts: float) -> None:
+    for tok, b in ms.books.items():
+        rows = rows_by_token.get(tok)
+        if not rows:
+            continue
+        i = bisect.bisect_right(rows, ts)
+        if i == 0 or i >= len(rows):
+            continue                                   # before its first row, or after its last: no evidence
+        if rows[i] - rows[i - 1] <= LIVE_GAP_S:
+            b.ts = ts
+
+
+async def _tick(ts: float, ms, pf, px, oms, risk, strategies, withdrawals: Withdrawals | None = None) -> None:
     now = datetime.fromtimestamp(ts, tz=timezone.utc)
     pf.roll_day(ms.books, now=now)
     for f in await oms.drain_fills():
@@ -162,6 +192,8 @@ async def _tick(ts: float, ms, pf, px, oms, risk, strategies) -> None:
     for s in strategies:
         intents.extend(s.on_tick(ctx))
     rep = risk.evaluate(intents, ctx, geoblock_ok=True)
+    if withdrawals is not None:
+        withdrawals.record(ctx.open_orders, rep.accepted, rep.rejected, strategies, ms.market_for)
     await oms.sync(rep.accepted)
 
 
