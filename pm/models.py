@@ -71,6 +71,7 @@ class Book:
     asks: list[Level] = field(default_factory=list)
     ts: float = field(default_factory=time.time)  # local receipt time (epoch s)
     hash: str = ""
+    traded_total: Optional[Decimal] = None        # venue's running traded-volume counter, where it publishes one
 
     # ---- top of book
     @property

@@ -104,6 +104,26 @@ Keys come from `polymarket.us/developer` and go in `.env` as `PM_US_KEY_ID`
 and `PM_US_SECRET_KEY`. The venue caps streaming subscriptions
 (`venue_us.ws_max_markets`); other markets are REST-polled.
 
+## Which markets can a small order actually fill in? `measure`
+
+```bash
+python -m pm --venue us measure                      # the venue's current tape
+python -m pm --venue us measure --db data/archive_optimistic/pm_polymarket_us.sqlite --csv data/measure.csv
+```
+
+One row per market (the mirrored short side of a Polymarket US market is the
+same book and is not repeated): how often the spread is 1, 2 or 3+ ticks, the
+median size waiting at the best bid and ask, contracts traded per hour against
+each side, and the hours until a 20-contract order (`--size`) would fill if it
+joins the back of the queue, or if it prices one tick better where the spread
+allows. Markets with measured flow come first, fastest first.
+
+Flow comes from trade prints where the tape has them (streamed markets), from
+the venue's traded-volume counter (Polymarket US tapes recorded from
+2026-10-18), or otherwise from size that left the best price between snapshots.
+That last source counts cancellations as trades, so those rows show fill times
+as lower bounds (`>=`).
+
 ## Measuring whether it works: markouts
 
 `python -m pm status` prints, per strategy and per token, three numbers in

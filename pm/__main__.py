@@ -4,6 +4,7 @@
   scan      one-shot structural scan across the universe (no trading)
   run       run the engine (mode from config.yaml or --mode)
   status    summarise the SQLite tape
+  measure   per-market queue depth vs trading flow: can a small order fill?
   backtest  replay the recorded tape through the strategies
 """
 
@@ -44,6 +45,13 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--since-hours", type=float, default=0.0, help="restrict markouts/equity to this window")
     st.add_argument("--db", help="read this SQLite file instead of the venue's tape (e.g. data/pm.sqlite)")
 
+    sm = sub.add_parser("measure", help="per-market queue depth vs trading flow, spreads, fill times")
+    sm.add_argument("--db", help="tape to measure (default: the venue's tape)")
+    sm.add_argument("--since-hours", type=float, default=0.0, help="only the last N hours of the tape (0 = all)")
+    sm.add_argument("--size", type=float, default=20.0, help="order size in contracts")
+    sm.add_argument("--top", type=int, default=30, help="rows to print")
+    sm.add_argument("--csv", help="also write every row to this CSV file")
+
     sb = sub.add_parser("backtest")
     sb.add_argument("--since-hours", type=float, default=24.0)
     sb.add_argument("--tick-seconds", type=float, default=5.0)
@@ -57,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run" and args.mode:
         cfg.mode = Mode(args.mode)
     tape = Path(cfg.db_file)
-    if args.cmd in ("backtest", "status"):
+    if args.cmd in ("backtest", "status", "measure"):
         # Reports: print only the report, and never write into the log file of a bot that may be running.
         setup("WARNING", log_dir=str(tape.parent), log_name="pm_reports.log")
     else:
@@ -77,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run(cfg)
         if args.cmd == "status":
             return _status(cfg, args.since_hours, args.db)
+        if args.cmd == "measure":
+            return _measure(cfg, args)
         if args.cmd == "backtest":
             from .backtest import run_backtest
             return run_backtest(cfg, since_hours=args.since_hours, tick_seconds=args.tick_seconds, db=args.db)
@@ -322,6 +332,27 @@ def _run(cfg: Config) -> int:
     except KeyboardInterrupt:
         # Windows: no signal handlers; asyncio.run has already cancelled the task and awaited shutdown.
         print("\nstopped.")
+    return 0
+
+
+def _measure(cfg: Config, args) -> int:
+    from .measure import measure_tape, print_report, write_csv
+    from .store import Store
+
+    path = args.db or cfg.db_file
+    if not Path(path).exists():
+        print(f"No tape at {path}. Run the bot on this venue first, or pass --db <file>.")
+        return 1
+    print(f"tape: {path}")
+    s = Store(path)
+    try:
+        rows, info = measure_tape(s, since_hours=args.since_hours, size=args.size)
+    finally:
+        s.close()
+    print_report(rows, info, top=args.top)
+    if args.csv:
+        write_csv(rows, args.csv)
+        print(f"\nall {len(rows)} rows written to {args.csv}")
     return 0
 
 

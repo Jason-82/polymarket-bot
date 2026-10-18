@@ -279,6 +279,13 @@ def books_from_us(slug: str, data: dict[str, Any], ts: Optional[float] = None) -
         asks=[Level(ONE - l.price, l.size) for l in bids],
         ts=ts,
     )
+    stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
+    traded = stats.get("sharesTraded")
+    if traded not in (None, ""):
+        try:
+            long_book.traded_total = short_book.traded_total = D(traded)
+        except Exception:
+            pass
     return long_book, short_book
 
 

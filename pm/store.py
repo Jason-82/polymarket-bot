@@ -71,6 +71,8 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
+        if "traded_total" not in {r[1] for r in self._db.execute("PRAGMA table_info(books)")}:
+            self._db.execute("ALTER TABLE books ADD COLUMN traded_total TEXT")   # tapes from before 2026-10-18
         self._buf: list[tuple[str, tuple]] = []
         self._last_book_ts: dict[str, float] = {}
         self._last_book_key: dict[str, tuple] = {}
@@ -126,6 +128,8 @@ class Store:
         )
 
     _BOOK_SQL = "INSERT INTO books(ts, token_id, best_bid, best_ask, bid_sz, ask_sz, top) VALUES (?,?,?,?,?,?,?)"
+    _BOOK_SQL_VOL = ("INSERT INTO books(ts, token_id, best_bid, best_ask, bid_sz, ask_sz, top, traded_total) "
+                     "VALUES (?,?,?,?,?,?,?,?)")
 
     def book(self, b: Book, force: bool = False) -> None:
         """Snapshot on top-of-book change (rate-limited), plus a heartbeat row every 10s.
@@ -135,10 +139,10 @@ class Store:
         this, the tape could miss the final state of a burst, and markouts would read a stale midpoint.
         """
         now = time.time()
-        key = (b.best_bid, b.best_ask, b.bid_size_at_touch, b.ask_size_at_touch)
+        key = (b.best_bid, b.best_ask, b.bid_size_at_touch, b.ask_size_at_touch, b.traded_total)
         last_ts = self._last_book_ts.get(b.token_id, 0.0)
         params = (now, b.token_id, _s(b.best_bid), _s(b.best_ask), str(b.bid_size_at_touch),
-                  str(b.ask_size_at_touch), json.dumps(b.top(5)))
+                  str(b.ask_size_at_touch), json.dumps(b.top(5)), _s(b.traded_total))
         if not force:
             unchanged = self._last_book_key.get(b.token_id) == key
             if unchanged and now - last_ts < self._heartbeat:
@@ -150,14 +154,14 @@ class Store:
         self._pending_books.pop(b.token_id, None)
         self._last_book_ts[b.token_id] = now
         self._last_book_key[b.token_id] = key
-        self._q(self._BOOK_SQL, params)
+        self._q(self._BOOK_SQL_VOL, params)
 
     def _drain_pending_books(self) -> None:
         pending, self._pending_books = self._pending_books, {}
         for token_id, (key, params) in pending.items():
             self._last_book_ts[token_id] = params[0]
             self._last_book_key[token_id] = key
-            self._buf.append((self._BOOK_SQL, params))
+            self._buf.append((self._BOOK_SQL_VOL, params))
 
     def trade(self, token_id: str, price: Decimal, size: Decimal, side: Side, ts: float) -> None:
         self._q("INSERT INTO trades(ts, token_id, price, size, side) VALUES (?,?,?,?,?)",
