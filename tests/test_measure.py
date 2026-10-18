@@ -109,6 +109,66 @@ def test_flow_uses_the_stretch_the_prints_cover():
     s.close()
 
 
+# ------------------------------------------------------------------ one sweep is one order, not a rate
+
+def _quiet_streamed(slug="x", hours=10):
+    m = _us(slug)
+    s = _tape([m], hours=hours)
+    for k in range(hours + 1):
+        _row(s, k * H, f"{slug}|L", "0.50", "0.51", 5000, 5000)
+    return s
+
+
+def test_a_sweep_of_many_prints_counts_as_one_burst():
+    s = _quiet_streamed()
+    for k in range(13):                                         # one seller sweeps 13 bids within 1.2 s
+        s.trade("x|L", D("0.50"), D(500), Side.SELL, 4 * H + k * 0.1)
+    rows, _ = measure_tape(s)
+    r = _one(rows)
+    assert r.prints == 13 and r.bursts == 1 and r.flow_source == "few" and not r.ranked
+    assert r.flow_hours == pytest.approx(10.0)
+    assert r.sell_flow_h == pytest.approx(6500 / 10.0)          # 650/h; the span estimate gave ~65 million/h
+    s.close()
+
+
+def test_bursts_minutes_apart_are_rated_over_at_least_an_hour():
+    s = _quiet_streamed()
+    for k in range(6):                                          # six separate orders within one minute
+        s.trade("x|L", D("0.50"), D(100), Side.SELL, 4 * H + k * 10.0)
+    rows, _ = measure_tape(s)
+    r = _one(rows)
+    assert r.bursts == 6 and r.flow_source == "trades"
+    assert r.flow_hours == pytest.approx(1.0)                   # the floor, not 70 s
+    assert r.sell_flow_h == pytest.approx(600)
+    s.close()
+
+
+def test_the_flow_window_never_exceeds_the_observed_time():
+    m = _us()
+    s = _tape([m], hours=1)
+    for k in range(181):                                        # observed for 30 minutes only
+        _row(s, 10 * k, "x|L", "0.50", "0.51", 100, 100)
+    for k in range(6):
+        s.trade("x|L", D("0.50"), D(10), Side.SELL, 600 + k * 10.0)
+    rows, _ = measure_tape(s)
+    r = _one(rows)
+    assert r.hours == pytest.approx(0.5) and r.flow_hours == pytest.approx(0.5)   # not the 1 h floor
+    s.close()
+
+
+def test_bursts_are_counted_per_side():
+    s = _quiet_streamed()
+    for k in range(5):                                          # a sell and a buy at the same instant: two orders
+        s.trade("x|L", D("0.50"), D(10), Side.SELL, (2 + k) * H)
+        s.trade("x|L", D("0.51"), D(10), Side.BUY, (2 + k) * H)
+        s.trade("x|L", D("0.51"), D(10), Side.BUY, (2 + k) * H + 0.5)   # same buyer, next maker
+    rows, _ = measure_tape(s)
+    r = _one(rows)
+    assert r.prints == 15 and r.bursts == 10 and r.flow_source == "trades"
+    assert r.flow_hours == pytest.approx(4 * 11 / 9)            # first-to-last burst 4 h, scaled (n+1)/(n-1)
+    s.close()
+
+
 # ------------------------------------------------------------------ F2: counter only over the time it covers
 
 def test_venue_counter_is_divided_by_the_time_it_was_recorded():

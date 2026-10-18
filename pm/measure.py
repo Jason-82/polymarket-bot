@@ -10,10 +10,13 @@ One block per book (the mirrored short side of a Polymarket US market is the sam
   1-cent spread is 10 ticks on a 0.001-tick market).
 - queue: time-weighted median size at the best bid and the best ask.
 - flow: contracts per hour hitting the bid (sellers) and lifting the ask (buyers), from
-    trades  trade prints. Streaming can cover only part of a tape (the streamed set changes with the universe),
-            so the rate is taken over the stretch the prints cover: first-to-last print, scaled by (n+1)/(n-1),
-            the unbiased estimate for n evenly spread prints, never more than the observed time.
-            Fewer than MIN_PRINTS prints: shown, flagged "few", not ranked.
+    trades  trade prints. One taker order that sweeps several resting orders prints several trades at once, so
+            prints on one side less than BURST_S apart count as one burst, and bursts are what is counted.
+            Streaming can cover only part of a tape (the streamed set changes with the universe), so the rate is
+            taken over the stretch the bursts cover: first-to-last burst, scaled by (n+1)/(n-1), the unbiased
+            estimate for n evenly spread bursts, never less than MIN_FLOW_WINDOW_S (bursts minutes apart say
+            nothing about an hourly rate) and never more than the observed time.
+            Fewer than MIN_PRINTS bursts: shown, flagged "few", not ranked.
     venue   the venue's traded-volume counter (Polymarket US tapes from 2026-10-18), over the time it was
             recorded. It has no side, so it is split evenly. Where streamed markets have both prints and the
             counter, the counter is calibrated against the prints and the ratio is printed.
@@ -39,7 +42,9 @@ from .store import Store
 
 MAX_GAP_S = 300.0          # REST-polled books: a longer silence means the market was not being watched
 STREAM_MAX_GAP_S = 3600.0  # streamed books: a quiet hour still counts; longer probably means it left the universe
-MIN_PRINTS = 5             # fewer prints than this: too few to rely on
+MIN_PRINTS = 5             # fewer bursts of prints than this: too few to rely on
+BURST_S = 1.0              # prints on one side closer than this are one taker order sweeping several makers
+MIN_FLOW_WINDOW_S = 3600.0 # a print-based rate is never taken over less than an hour (or the observed time)
 MIN_COUNTER_S = 600.0      # at least 10 minutes of volume-counter coverage
 MIN_IMPROVE_SHARE = 0.05   # pricing inside the spread must be possible at least 5% of the time to be reported
 WIDTH = 79
@@ -66,6 +71,7 @@ class MarketMeasure:
     wide_buy_flow_h: float = 0.0
     flow_source: str = "book"      # trades | venue | few | book
     prints: int = 0
+    bursts: int = 0                # prints grouped into taker orders (see BURST_S)
     flow_hours: float = 0.0        # hours the flow figure is based on
     mid_moves_h: float = 0.0
     fill_join_bid_h: float = math.inf
@@ -215,9 +221,15 @@ def measure_token(store: Store, market: Market, token_id: str, since_ts: float, 
             kept.append((ts, side, float(sz), intervals[i][2]))
     out.prints = len(kept)
     if kept:
-        n = len(kept)
-        span = kept[-1][0] - kept[0][0]
-        window = min(observed_s, span * (n + 1) / (n - 1)) if n >= 2 and span > 0 else observed_s
+        bursts: list[float] = []
+        last_on: dict[str, float] = {}
+        for ts, side, _, _ in kept:
+            if ts - last_on.get(side, -math.inf) >= BURST_S:
+                bursts.append(ts)
+            last_on[side] = ts
+        n = out.bursts = len(bursts)
+        span = bursts[-1] - bursts[0]
+        window = min(observed_s, max(MIN_FLOW_WINDOW_S, span * (n + 1) / (n - 1))) if n >= 2 else observed_s
         frac = window / observed_s
         out.flow_hours = window / 3600.0
         out.sell_flow_h = sum(z for _, s, z, _ in kept if s == "SELL") / out.flow_hours
@@ -334,8 +346,10 @@ def print_report(rows: list[MarketMeasure], info: dict, top: int = 30) -> None:
         else:
             print(f"    fill time  join bid/ask {_h(r.fill_join_bid_h)}/{_h(r.fill_join_ask_h)}   "
                   f"one tick better {_h(r.fill_improve_bid_h)}/{_h(r.fill_improve_ask_h)}")
-            src = {"trades": f"{r.prints} prints over {r.flow_hours:.1f}h",
-                   "few": f"only {r.prints} print{'s' if r.prints != 1 else ''}: too few to rely on",
+            n_prints = f"{r.prints} print{'s' if r.prints != 1 else ''}"
+            n_bursts = "" if r.bursts == r.prints else f" in {r.bursts} burst{'s' if r.bursts != 1 else ''}"
+            src = {"trades": f"{n_prints}{n_bursts} over {r.flow_hours:.1f}h",
+                   "few": f"only {n_prints}{n_bursts}: too few to rely on",
                    "venue": f"venue counter, {r.flow_hours:.1f}h"
                             + ("" if info.get("counter_ratio") else " (uncalibrated)")}[r.flow_source]
             print(f"    flow/h sell/buy {_fmt_n(r.sell_flow_h)}/{_fmt_n(r.buy_flow_h)}  from {src}"[:WIDTH])
@@ -357,7 +371,8 @@ def print_report(rows: list[MarketMeasure], info: dict, top: int = 30) -> None:
     few = sum(1 for r in rows if r.flow_source == "few")
     book = sum(1 for r in rows if r.flow_source == "book")
     if few:
-        print(_wrap(f"{few} markets have fewer than {MIN_PRINTS} trade prints: shown, not counted above."))
+        print(_wrap(f"{few} markets have fewer than {MIN_PRINTS} bursts of trade prints (prints on one side less "
+                    f"than {BURST_S:g}s apart are one taker order): shown, not counted above."))
     if book:
         print(_wrap(f"{book} markets have no trade data at all: their book churn is not trading, so they are not "
                     f"ranked. Tapes recorded from 2026-10-18 carry the venue's volume counter for every market."))
@@ -370,7 +385,7 @@ def print_report(rows: list[MarketMeasure], info: dict, top: int = 30) -> None:
 
 
 def write_csv(rows: list[MarketMeasure], path: str) -> None:
-    cols = ["label", "slug", "token_id", "tick", "hours", "coverage", "flow_source", "prints", "flow_hours",
+    cols = ["label", "slug", "token_id", "tick", "hours", "coverage", "flow_source", "prints", "bursts", "flow_hours",
             "sell_flow_h", "buy_flow_h", "bid_depth", "ask_depth", "spread_1", "spread_2", "spread_3plus",
             "median_spread_c", "can_improve", "wide_sell_flow_h", "wide_buy_flow_h", "fill_join_bid_h",
             "fill_join_ask_h", "join_round_trip_h", "fill_improve_bid_h", "fill_improve_ask_h",

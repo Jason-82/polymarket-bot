@@ -121,10 +121,12 @@ only trading seen while the spread allowed that. A maker needs both sides to
 fill, so markets are ranked by the slower side.
 
 Flow comes from trade prints where the tape has them (streamed markets), taken
-over the stretch the prints cover; or from the venue's traded-volume counter
-(Polymarket US tapes recorded from 2026-10-18), over the time it was recorded,
-calibrated against trade prints where both exist. Markets with fewer than 5
-prints are shown but not ranked. Markets with no trade data at all show only
+over the stretch the prints cover but never less than an hour; or from the
+venue's traded-volume counter (Polymarket US tapes recorded from 2026-10-18),
+over the time it was recorded, calibrated against trade prints where both
+exist. One taker order that sweeps several resting orders prints several
+trades at once, so prints on the same side less than a second apart count as
+one burst. Markets with fewer than 5 bursts are shown but not ranked. Markets with no trade data at all show only
 book churn, which is not trading, and get no fill time. Reports open tapes
 read-only and never modify them.
 
