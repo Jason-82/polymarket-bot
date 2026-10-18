@@ -1,21 +1,27 @@
 """Measure every market on a tape: is there enough trading for a small resting order to ever fill?
 
-For each market (one row per book; the mirrored short book of a Polymarket US market is the same book and is
-skipped) the tape gives:
+One block per book (the mirrored short side of a Polymarket US market is the same book and is skipped):
 
-- spread, in ticks, time-weighted: how often there is room to price one tick better than the best quote;
-- queue depth: the time-weighted median size waiting at the best bid and at the best ask;
-- flow: contracts traded per hour against each side (sellers hitting bids, buyers lifting asks), from the best
-  source the tape has:
-    trades   the venue's trade prints (streamed markets only)
-    venue    the venue's running traded-volume counter (Polymarket US tapes from 2026-10-18 on), split evenly
-             between the two sides because the counter has no side
-    <=book   size that disappeared from the best price between snapshots: trades AND cancellations, so an
-             UPPER bound on flow; the true flow can be far lower
-- fill time: hours until an order of `size` would fill, if it joins the back of the queue (queue + size must
-  trade) or, when the spread allows, prices one tick better (only `size` must trade). Lower is better.
-
-Periods where the tape has no row for a market for more than MAX_GAP_S are not counted as observed time.
+- observed time. The recorder must have been running (book rows on the tape, from any market, never more than a
+  minute apart). A REST-polled book writes a row at least every ~10 s, so a silence of more than MAX_GAP_S in its
+  own rows means it left the universe. A STREAMED book (one with trade prints) only writes a row when it changes,
+  so its quiet spells count as observed while the recorder ran, up to STREAM_MAX_GAP_S.
+- spread: share of observed time at 1, 2 and 3+ ticks, and the median spread in cents (the tick size matters: a
+  1-cent spread is 10 ticks on a 0.001-tick market).
+- queue: time-weighted median size at the best bid and the best ask.
+- flow: contracts per hour hitting the bid (sellers) and lifting the ask (buyers), from
+    trades  trade prints. Streaming can cover only part of a tape (the streamed set changes with the universe),
+            so the rate is taken over the stretch the prints cover: first-to-last print, scaled by (n+1)/(n-1),
+            the unbiased estimate for n evenly spread prints, never more than the observed time.
+            Fewer than MIN_PRINTS prints: shown, flagged "few", not ranked.
+    venue   the venue's traded-volume counter (Polymarket US tapes from 2026-10-18), over the time it was
+            recorded. It has no side, so it is split evenly. Where streamed markets have both prints and the
+            counter, the counter is calibrated against the prints and the ratio is printed.
+    book    no trade data: only size that left the best price between snapshots. That counts cancels and misses
+            trades refilled between polls, so it is neither an upper nor a lower bound. Not ranked.
+- fill hours for an order of `size`: joining the back of the queue needs queue + size to trade on that side;
+  pricing one tick better needs only `size`, using only the flow seen WHILE the spread was 2+ ticks wide. A
+  maker needs both sides to fill, so markets are ranked by the slower side (the round trip).
 """
 
 from __future__ import annotations
@@ -23,57 +29,88 @@ from __future__ import annotations
 import bisect
 import csv
 import math
+import textwrap
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Optional
 
 from .models import Market
 from .store import Store
 
-MAX_GAP_S = 300.0      # same liveness rule as the backtest: a longer silence means the market was not watched
+MAX_GAP_S = 300.0          # REST-polled books: a longer silence means the market was not being watched
+STREAM_MAX_GAP_S = 3600.0  # streamed books: a quiet hour still counts; longer probably means it left the universe
+MIN_PRINTS = 5             # fewer prints than this: too few to rely on
+MIN_COUNTER_S = 600.0      # at least 10 minutes of volume-counter coverage
+MIN_IMPROVE_SHARE = 0.05   # pricing inside the spread must be possible at least 5% of the time to be reported
+WIDTH = 79
 
 
 @dataclass
 class MarketMeasure:
     token_id: str
     label: str
+    slug: str
     tick: Decimal
     hours: float = 0.0
+    coverage: float = 0.0          # observed hours / hours the recorder ran
     rows: int = 0
-    spread_1: float = 0.0          # share of observed time with a 1-tick spread
+    spread_1: float = 0.0
     spread_2: float = 0.0
     spread_3plus: float = 0.0
-    bid_depth: float = 0.0         # time-weighted median size at the best bid
+    median_spread_c: float = 0.0
+    bid_depth: float = 0.0
     ask_depth: float = 0.0
     sell_flow_h: float = 0.0       # contracts per hour hitting the bid
     buy_flow_h: float = 0.0        # contracts per hour lifting the ask
-    flow_source: str = "none"
+    wide_sell_flow_h: float = 0.0  # the same, only while the spread was 2+ ticks
+    wide_buy_flow_h: float = 0.0
+    flow_source: str = "book"      # trades | venue | few | book
+    prints: int = 0
+    flow_hours: float = 0.0        # hours the flow figure is based on
     mid_moves_h: float = 0.0
-    trades: int = 0
     fill_join_bid_h: float = math.inf
     fill_join_ask_h: float = math.inf
     fill_improve_bid_h: float = math.inf
     fill_improve_ask_h: float = math.inf
+    # raw material for the tape-level counter calibration
+    counter_total: float = 0.0
+    counter_secs: float = 0.0
+    counter_wide: float = 0.0
+    counter_wide_secs: float = 0.0
+    calib_counter: float = 0.0
+    calib_prints: float = 0.0
+    wide_secs: float = 0.0
 
     @property
     def can_improve(self) -> float:
-        """Share of observed time with room to price inside the spread (2+ ticks)."""
         return self.spread_2 + self.spread_3plus
 
     @property
-    def best_join_h(self) -> float:
-        return min(self.fill_join_bid_h, self.fill_join_ask_h)
+    def ranked(self) -> bool:
+        return self.flow_source in ("trades", "venue")
 
     @property
-    def best_improve_h(self) -> float:
-        return min(self.fill_improve_bid_h, self.fill_improve_ask_h)
+    def join_round_trip_h(self) -> float:
+        return max(self.fill_join_bid_h, self.fill_join_ask_h)
+
+    @property
+    def improve_round_trip_h(self) -> float:
+        return max(self.fill_improve_bid_h, self.fill_improve_ask_h)
+
+
+def _d(x: Any) -> Optional[Decimal]:
+    if x is None or x == "":
+        return None
+    try:
+        return Decimal(str(x))
+    except Exception:
+        return None
 
 
 def _weighted_median(pairs: list[tuple[float, float]]) -> float:
-    pairs = [(v, w) for v, w in pairs if w > 0]
+    pairs = sorted((v, w) for v, w in pairs if w > 0)
     if not pairs:
         return 0.0
-    pairs.sort()
     half = sum(w for _, w in pairs) / 2
     acc = 0.0
     for v, w in pairs:
@@ -83,96 +120,6 @@ def _weighted_median(pairs: list[tuple[float, float]]) -> float:
     return pairs[-1][0]
 
 
-def _f(x: Any) -> Optional[float]:
-    if x is None or x == "":
-        return None
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
-def measure_token(store: Store, market: Market, token_id: str, since_ts: float, size: float) -> MarketMeasure:
-    tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
-    label = market.question if market.synthetic_no else f"{market.question} [{_outcome(market, token_id)}]"
-    out = MarketMeasure(token_id=token_id, label=label, tick=tick)
-    rows = store.query(
-        "SELECT ts, best_bid, best_ask, bid_sz, ask_sz, traded_total FROM books WHERE token_id=? AND ts >= ? "
-        "ORDER BY ts", (token_id, since_ts))
-    out.rows = len(rows)
-    t = float(tick)
-    observed = 0.0
-    spread_w = {1: 0.0, 2: 0.0, 3: 0.0}
-    bid_depths: list[tuple[float, float]] = []
-    ask_depths: list[tuple[float, float]] = []
-    moves = 0
-    dep_bid = dep_ask = 0.0
-    counter = 0.0
-    counter_seen = 0
-    intervals: list[tuple[float, float]] = []      # observed, quotable time
-    for cur, nxt in zip(rows, rows[1:]):
-        gap = nxt[0] - cur[0]
-        if gap <= 0 or gap > MAX_GAP_S:
-            continue
-        cb, ca, cbs, cas, ctt = _f(cur[1]), _f(cur[2]), _f(cur[3]) or 0.0, _f(cur[4]) or 0.0, _f(cur[5])
-        nb, na, nbs, nas, ntt = _f(nxt[1]), _f(nxt[2]), _f(nxt[3]) or 0.0, _f(nxt[4]) or 0.0, _f(nxt[5])
-        if cb is None or ca is None or ca <= cb:
-            continue                                   # one-sided, empty, locked or crossed: not quotable
-        observed += gap
-        intervals.append((cur[0], nxt[0]))
-        ticks = max(1, round((ca - cb) / t))
-        spread_w[min(ticks, 3)] += gap
-        bid_depths.append((cbs, gap))
-        ask_depths.append((cas, gap))
-        if nb is not None and na is not None and (nb + na) != (cb + ca):
-            moves += 1
-        if nb is not None:                             # size that left the best bid: traded or cancelled
-            dep_bid += max(0.0, cbs - nbs) if nb == cb else (cbs if nb < cb else 0.0)
-        if na is not None:
-            dep_ask += max(0.0, cas - nas) if na == ca else (cas if na > ca else 0.0)
-        if ctt is not None and ntt is not None:
-            counter_seen += 1
-            if ntt >= ctt:                             # a drop is the counter resetting, not negative volume
-                counter += ntt - ctt
-    out.hours = observed / 3600.0
-    if observed <= 0:
-        return out
-    out.spread_1, out.spread_2, out.spread_3plus = (spread_w[k] / observed for k in (1, 2, 3))
-    out.bid_depth = _weighted_median(bid_depths)
-    out.ask_depth = _weighted_median(ask_depths)
-    out.mid_moves_h = moves / out.hours
-
-    starts = [a for a, _ in intervals]
-    trades = []
-    for ts, side, sz in store.query("SELECT ts, side, size FROM trades WHERE token_id=? AND ts >= ? ORDER BY ts",
-                                    (token_id, since_ts)):
-        i = bisect.bisect_right(starts, ts) - 1        # only prints inside observed time count against it
-        if i >= 0 and ts <= intervals[i][1]:
-            trades.append((side, sz))
-    out.trades = len(trades)
-    if trades:
-        out.flow_source = "trades"
-        out.sell_flow_h = sum(float(s) for side, s in trades if side == "SELL") / out.hours
-        out.buy_flow_h = sum(float(s) for side, s in trades if side == "BUY") / out.hours
-    elif counter_seen:
-        out.flow_source = "venue"
-        out.sell_flow_h = out.buy_flow_h = counter / 2 / out.hours
-    else:
-        out.flow_source = "<=book"
-        out.sell_flow_h = dep_bid / out.hours
-        out.buy_flow_h = dep_ask / out.hours
-
-    def hours(queue: float, flow: float) -> float:
-        return (queue + size) / flow if flow > 0 else math.inf
-
-    out.fill_join_bid_h = hours(out.bid_depth, out.sell_flow_h)
-    out.fill_join_ask_h = hours(out.ask_depth, out.buy_flow_h)
-    if out.can_improve > 0:
-        out.fill_improve_bid_h = hours(0.0, out.sell_flow_h)
-        out.fill_improve_ask_h = hours(0.0, out.buy_flow_h)
-    return out
-
-
 def _outcome(m: Market, token_id: str) -> str:
     for tk in m.tokens:
         if tk.token_id == token_id:
@@ -180,28 +127,192 @@ def _outcome(m: Market, token_id: str) -> str:
     return "?"
 
 
+def measure_token(store: Store, market: Market, token_id: str, since_ts: float, size: float,
+                  spans: list[tuple[float, float]], has_counter_col: bool = True) -> MarketMeasure:
+    tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+    label = market.question if market.synthetic_no else f"{market.question} [{_outcome(market, token_id)}]"
+    slug = token_id[:-2] if market.synthetic_no and token_id.endswith("|L") else token_id
+    out = MarketMeasure(token_id=token_id, label=label, slug=slug, tick=tick)
+    tt_col = "traded_total" if has_counter_col else "NULL"
+    rows = [(r[0], _d(r[1]), _d(r[2]), _d(r[3]) or Decimal(0), _d(r[4]) or Decimal(0), _d(r[5]))
+            for r in store.query(f"SELECT ts, best_bid, best_ask, bid_sz, ask_sz, {tt_col} FROM books "
+                                 "WHERE token_id=? AND ts >= ? ORDER BY ts", (token_id, since_ts))]
+    out.rows = len(rows)
+    prints = store.query("SELECT ts, side, size FROM trades WHERE token_id=? AND ts >= ? ORDER BY ts",
+                         (token_id, since_ts))
+    streamed = bool(prints)
+    gap_limit = STREAM_MAX_GAP_S if streamed else MAX_GAP_S
+
+    intervals: list[tuple[float, float, int]] = []      # observed, quotable: (start, end, spread ticks)
+    spread_w = {1: 0.0, 2: 0.0, 3: 0.0}
+    spread_c: list[tuple[float, float]] = []
+    bid_depths: list[tuple[float, float]] = []
+    ask_depths: list[tuple[float, float]] = []
+    moves = 0
+    dep_bid = dep_ask = 0.0
+    counter_pts: list[tuple[float, float]] = []         # (ts, cumulative counted volume) along observed stretches
+    last_tt: Optional[tuple[float, Decimal]] = None
+    counted = 0.0
+    for cur, nxt in zip(rows, rows[1:]):
+        gap = nxt[0] - cur[0]
+        observed = 0 < gap <= gap_limit and Store._within_one_span(spans, cur[0], nxt[0])
+        if not observed:
+            last_tt = None                                # a break: never diff the counter across it
+            continue
+        cb, ca, cbs, cas, ctt = cur[1:]
+        nb, na, nbs, nas, ntt = nxt[1:]
+        # volume counter: diff against the last value seen in this unbroken stretch (holes are skipped over)
+        if last_tt is None and ctt is not None:
+            last_tt = (cur[0], ctt)
+        if ntt is not None and last_tt is not None:
+            delta = ntt - last_tt[1]
+            if delta < 0:
+                delta = ntt                               # the counter restarted from zero
+            out.counter_total += float(delta)
+            out.counter_secs += nxt[0] - last_tt[0]
+            counted += float(delta)
+            counter_pts.append((nxt[0], counted))
+            if (last_tt[0] == cur[0] and cb is not None and ca is not None and ca > cb
+                    and (ca - cb) / tick >= Decimal("1.5")):
+                out.counter_wide += float(delta)
+                out.counter_wide_secs += gap
+            last_tt = (nxt[0], ntt)
+        elif ntt is not None:
+            last_tt = (nxt[0], ntt)
+        if cb is None or ca is None or ca <= cb:
+            continue                                      # one-sided, empty, locked or crossed: not quotable
+        ticks = max(1, int(((ca - cb) / tick).to_integral_value(rounding=ROUND_HALF_UP)))
+        intervals.append((cur[0], nxt[0], ticks))
+        spread_w[min(ticks, 3)] += gap
+        if ticks >= 2:
+            out.wide_secs += gap
+        spread_c.append((float((ca - cb) * 100), gap))
+        bid_depths.append((float(cbs), gap))
+        ask_depths.append((float(cas), gap))
+        if nb is not None and na is not None and na > nb and (nb + na) != (cb + ca):
+            moves += 1
+        if nb is not None:
+            dep_bid += float(max(Decimal(0), cbs - nbs) if nb == cb else (cbs if nb < cb else Decimal(0)))
+        if na is not None:
+            dep_ask += float(max(Decimal(0), cas - nas) if na == ca else (cas if na > ca else Decimal(0)))
+
+    observed_s = sum(b - a for a, b, _ in intervals)
+    out.hours = observed_s / 3600.0
+    if observed_s <= 0:
+        return out
+    out.spread_1, out.spread_2, out.spread_3plus = (spread_w[k] / observed_s for k in (1, 2, 3))
+    out.median_spread_c = _weighted_median(spread_c)
+    out.bid_depth = _weighted_median(bid_depths)
+    out.ask_depth = _weighted_median(ask_depths)
+    out.mid_moves_h = moves / out.hours
+
+    # prints inside observed time, each tagged with the spread at that moment
+    starts = [a for a, _, _ in intervals]
+    kept: list[tuple[float, str, float, int]] = []
+    for ts, side, sz in prints:
+        i = bisect.bisect_right(starts, ts) - 1
+        if i >= 0 and ts <= intervals[i][1]:
+            kept.append((ts, side, float(sz), intervals[i][2]))
+    out.prints = len(kept)
+    if kept:
+        n = len(kept)
+        span = kept[-1][0] - kept[0][0]
+        window = min(observed_s, span * (n + 1) / (n - 1)) if n >= 2 and span > 0 else observed_s
+        frac = window / observed_s
+        out.flow_hours = window / 3600.0
+        out.sell_flow_h = sum(z for _, s, z, _ in kept if s == "SELL") / out.flow_hours
+        out.buy_flow_h = sum(z for _, s, z, _ in kept if s == "BUY") / out.flow_hours
+        wide_h = out.wide_secs * frac / 3600.0
+        if wide_h > 0:
+            out.wide_sell_flow_h = sum(z for _, s, z, t in kept if s == "SELL" and t >= 2) / wide_h
+            out.wide_buy_flow_h = sum(z for _, s, z, t in kept if s == "BUY" and t >= 2) / wide_h
+        out.flow_source = "trades" if n >= MIN_PRINTS else "few"
+        # calibration material: counter volume over the stretch the prints cover
+        if counter_pts and n >= MIN_PRINTS:
+            lo, hi = kept[0][0], kept[-1][0]
+            inside = [c for t, c in counter_pts if lo <= t <= hi]
+            if len(inside) >= 2:
+                out.calib_counter = inside[-1] - inside[0]
+                out.calib_prints = sum(z for t, _, z, _ in kept if lo <= t <= hi)
+    if out.flow_source not in ("trades",) and out.counter_secs >= MIN_COUNTER_S:
+        out.flow_source = "venue"                        # flows filled in by finalize() after calibration
+    if out.flow_source == "book":
+        out.flow_hours = out.hours
+        out.sell_flow_h = dep_bid / out.hours
+        out.buy_flow_h = dep_ask / out.hours
+    return out
+
+
+def _finalize(r: MarketMeasure, size: float, counter_ratio: float) -> None:
+    if r.flow_source == "venue":
+        r.flow_hours = r.counter_secs / 3600.0
+        per_side = r.counter_total / counter_ratio / 2 / r.flow_hours
+        r.sell_flow_h = r.buy_flow_h = per_side
+        if r.counter_wide_secs > 0:
+            r.wide_sell_flow_h = r.wide_buy_flow_h = r.counter_wide / counter_ratio / 2 / (r.counter_wide_secs / 3600)
+
+    def hours(queue: float, flow: float) -> float:
+        return (queue + size) / flow if flow > 0 else math.inf
+
+    if r.flow_source in ("trades", "venue", "few"):
+        r.fill_join_bid_h = hours(r.bid_depth, r.sell_flow_h)
+        r.fill_join_ask_h = hours(r.ask_depth, r.buy_flow_h)
+        if r.can_improve >= MIN_IMPROVE_SHARE:
+            r.fill_improve_bid_h = hours(0.0, r.wide_sell_flow_h)
+            r.fill_improve_ask_h = hours(0.0, r.wide_buy_flow_h)
+
+
 def measure_tape(store: Store, since_hours: float = 0.0, size: float = 20.0) -> tuple[list[MarketMeasure], dict]:
     end = store.query("SELECT MAX(ts) FROM books")[0][0]
     start = store.query("SELECT MIN(ts) FROM books")[0][0]
     if end is None:
         return [], {}
-    since_ts = end - since_hours * 3600 if since_hours > 0 else start
-    out: list[MarketMeasure] = []
+    since_ts = max(start, end - since_hours * 3600) if since_hours > 0 else start
+    spans = [(max(a, since_ts), b) for a, b in store._alive_spans() if b >= since_ts]
+    up_h = sum(b - a for a, b in spans) / 3600.0
+    has_counter_col = "traded_total" in store.book_columns()
+    rows: list[MarketMeasure] = []
+    dropped = 0
     for m in store.load_markets():
         tokens = [m.yes.token_id] if m.synthetic_no else [t.token_id for t in m.tokens]
         for tok in tokens:
-            mm = measure_token(store, m, tok, since_ts, size)
+            mm = measure_token(store, m, tok, since_ts, size, spans, has_counter_col)
             if mm.hours > 0:
-                out.append(mm)
-    out.sort(key=lambda r: (r.flow_source == "<=book", r.best_join_h, r.best_improve_h))
-    return out, {"tape_hours": (end - since_ts) / 3600.0, "size": size}
+                mm.coverage = mm.hours / up_h if up_h > 0 else 0.0
+                rows.append(mm)
+            elif mm.rows:
+                dropped += 1
+    calib = [r for r in rows if r.calib_prints > 0 and r.calib_counter > 0]
+    ratio = None
+    if len(calib) >= 2:
+        ratio = sum(r.calib_counter for r in calib) / sum(r.calib_prints for r in calib)
+    for r in rows:
+        _finalize(r, size, ratio or 1.0)
+    rank = {"trades": 0, "venue": 0, "few": 1, "book": 2}
+    rows.sort(key=lambda r: (rank[r.flow_source], r.join_round_trip_h, r.improve_round_trip_h))
+    info = {"tape_hours": (end - since_ts) / 3600.0, "up_hours": up_h, "size": size, "dropped": dropped,
+            "counter_ratio": ratio, "counter_markets": len(calib)}
+    return rows, info
 
 
-def _h(x: float, lower_bound: bool = False) -> str:
+# ---------------------------------------------------------------------------------------------- report
+
+def _h(x: float) -> str:
     if math.isinf(x):
         return "never"
-    v = f"{x / 24:.0f}d" if x >= 1000 else (f"{x:.1f}" if x < 10 else f"{x:.0f}")
-    return (">=" + v) if lower_bound else v
+    if x < 1:
+        return f"{max(1, round(x * 60))}m"
+    if x >= 72:
+        return f"{x / 24:.0f}d"
+    return f"{x:.1f}h" if x < 10 else f"{x:.0f}h"
+
+
+def _fmt_n(x: float) -> str:
+    return f"{x:,.0f}" if x >= 10 else f"{x:.1f}"
+
+
+def _wrap(text: str, indent: str = "") -> str:
+    return textwrap.fill(text, width=WIDTH, initial_indent=indent, subsequent_indent=indent)
 
 
 def print_report(rows: list[MarketMeasure], info: dict, top: int = 30) -> None:
@@ -209,43 +320,67 @@ def print_report(rows: list[MarketMeasure], info: dict, top: int = 30) -> None:
         print("No markets with quotable books in this tape.")
         return
     size = info["size"]
-    print(f"\nMarket measurement over {info['tape_hours']:.1f}h of tape, for a {size:g}-contract order "
-          f"({len(rows)} books; measured flow first, best first)")
-    print(f"{'market':44} {'hrs':>5} {'spread 1t/2t/3t+ %':>18} {'depth bid/ask':>15} {'flow/h sell/buy':>16} "
-          f"{'src':>6} {'fill h: join':>12} {'improve':>8} {'moves/h':>7}")
-    for r in rows[:top]:
-        lb = r.flow_source == "<=book"
-        spread = f"{r.spread_1 * 100:.0f}/{r.spread_2 * 100:.0f}/{r.spread_3plus * 100:.0f}"
-        depth = f"{r.bid_depth:,.0f}/{r.ask_depth:,.0f}"
-        flow = f"{r.sell_flow_h:,.0f}/{r.buy_flow_h:,.0f}"
-        print(f"{r.label[:44]:44} {r.hours:>5.1f} {spread:>18} {depth:>15} {flow:>16} {r.flow_source:>6} "
-              f"{_h(r.best_join_h, lb):>12} {_h(r.best_improve_h, lb):>8} {r.mid_moves_h:>7.1f}")
-    if len(rows) > top:
-        print(f"... {len(rows) - top} more (use --top or --csv to see all)")
-    measured = [r for r in rows if r.flow_source in ("trades", "venue")]
-    book_only = [r for r in rows if r.flow_source == "<=book"]
     print()
-    if measured:
-        fast = [r for r in measured if r.best_join_h <= 24]
-        print(f"Measured flow ({len(measured)} books): {len(fast)} would fill a {size:g}-lot joining the queue within "
-              f"24h; {sum(1 for r in measured if r.can_improve >= 0.2)} have room to improve the price at least 20% "
-              f"of the time.")
-    if book_only:
-        slow = [r for r in book_only if r.best_join_h > 24]
-        print(f"Book-only estimate ({len(book_only)} books, no trade data): fill times are lower bounds, because "
-              f"size that left the book counts as traded even when it was cancelled. {len(slow)} of them take "
-              f"more than 24h even so.")
-    none = [r for r in rows if r.flow_source == "none"]
-    if none:
-        print(f"{len(none)} books had no flow information at all.")
+    print(_wrap(f"Market measurement: {info['tape_hours']:.1f}h of tape (recorder running {info['up_hours']:.1f}h), "
+                f"for a {size:g}-contract order. Ranked by the slower side when joining the queue: a maker needs "
+                f"both sides to fill."))
+    for i, r in enumerate(rows[:top], 1):
+        print()
+        print(f"{i:>2}. {r.label[:WIDTH - 4]}")
+        print(f"    {r.slug[:40]}  tick {r.tick}  observed {r.hours:.1f}h ({r.coverage:.0%})")
+        if r.flow_source == "book":
+            print(f"    fill time: no trade data (book churn {_fmt_n(r.sell_flow_h)}/{_fmt_n(r.buy_flow_h)} "
+                  f"per h is not trades)")
+        else:
+            print(f"    fill time  join bid/ask {_h(r.fill_join_bid_h)}/{_h(r.fill_join_ask_h)}   "
+                  f"one tick better {_h(r.fill_improve_bid_h)}/{_h(r.fill_improve_ask_h)}")
+            src = {"trades": f"{r.prints} prints over {r.flow_hours:.1f}h",
+                   "few": f"only {r.prints} print{'s' if r.prints != 1 else ''}: too few to rely on",
+                   "venue": f"venue counter, {r.flow_hours:.1f}h"
+                            + ("" if info.get("counter_ratio") else " (uncalibrated)")}[r.flow_source]
+            print(f"    flow/h sell/buy {_fmt_n(r.sell_flow_h)}/{_fmt_n(r.buy_flow_h)}  from {src}"[:WIDTH])
+        print(f"    queue bid/ask {_fmt_n(r.bid_depth)}/{_fmt_n(r.ask_depth)}  spread 1/2/3+t "
+              f"{r.spread_1:.0%}/{r.spread_2:.0%}/{r.spread_3plus:.0%}  median {r.median_spread_c:.1f}c"[:WIDTH])
+    if len(rows) > top:
+        print(f"\n... {len(rows) - top} more (use --top N, or --csv to get every row)")
+
+    ranked = [r for r in rows if r.ranked]
+    print()
+    if ranked:
+        rt = [r for r in ranked if r.join_round_trip_h <= 24]
+        imp = [r for r in ranked if r.improve_round_trip_h <= 24]
+        print(_wrap(f"Markets with measured flow: {len(ranked)}. {len(rt)} would fill a {size:g}-lot on both sides "
+                    f"within 24h when joining the queue; {len(imp)} would within 24h when pricing one tick better "
+                    f"(only counting time when the spread allows it)."))
+    else:
+        print(_wrap("No market has measured trading flow on this tape (no trade prints, no venue volume counter)."))
+    few = sum(1 for r in rows if r.flow_source == "few")
+    book = sum(1 for r in rows if r.flow_source == "book")
+    if few:
+        print(_wrap(f"{few} markets have fewer than {MIN_PRINTS} trade prints: shown, not counted above."))
+    if book:
+        print(_wrap(f"{book} markets have no trade data at all: their book churn is not trading, so they are not "
+                    f"ranked. Tapes recorded from 2026-10-18 carry the venue's volume counter for every market."))
+    if info.get("counter_ratio"):
+        print(_wrap(f"Venue volume counter calibrated against trade prints on {info['counter_markets']} streamed "
+                    f"markets: counter = {info['counter_ratio']:.2f} x prints."))
+    if info.get("dropped"):
+        print(_wrap(f"{info['dropped']} markets were never quotable while observed (one-sided or crossed) and are "
+                    f"not shown."))
 
 
 def write_csv(rows: list[MarketMeasure], path: str) -> None:
-    cols = ["label", "token_id", "tick", "hours", "rows", "spread_1", "spread_2", "spread_3plus", "bid_depth",
-            "ask_depth", "sell_flow_h", "buy_flow_h", "flow_source", "trades", "mid_moves_h", "fill_join_bid_h",
-            "fill_join_ask_h", "fill_improve_bid_h", "fill_improve_ask_h"]
-    with open(path, "w", newline="", encoding="utf-8") as fh:
+    cols = ["label", "slug", "token_id", "tick", "hours", "coverage", "flow_source", "prints", "flow_hours",
+            "sell_flow_h", "buy_flow_h", "bid_depth", "ask_depth", "spread_1", "spread_2", "spread_3plus",
+            "median_spread_c", "can_improve", "wide_sell_flow_h", "wide_buy_flow_h", "fill_join_bid_h",
+            "fill_join_ask_h", "join_round_trip_h", "fill_improve_bid_h", "fill_improve_ask_h",
+            "improve_round_trip_h", "mid_moves_h", "rows"]
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:      # BOM: Excel on Windows reads UTF-8
         w = csv.writer(fh)
         w.writerow(cols)
         for r in rows:
-            w.writerow([getattr(r, c) for c in cols])
+            vals = []
+            for c in cols:
+                v = getattr(r, c)
+                vals.append("" if isinstance(v, float) and math.isinf(v) else v)
+            w.writerow(vals)

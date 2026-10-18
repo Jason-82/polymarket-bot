@@ -111,18 +111,22 @@ python -m pm --venue us measure                      # the venue's current tape
 python -m pm --venue us measure --db data/archive_optimistic/pm_polymarket_us.sqlite --csv data/measure.csv
 ```
 
-One row per market (the mirrored short side of a Polymarket US market is the
-same book and is not repeated): how often the spread is 1, 2 or 3+ ticks, the
-median size waiting at the best bid and ask, contracts traded per hour against
-each side, and the hours until a 20-contract order (`--size`) would fill if it
-joins the back of the queue, or if it prices one tick better where the spread
-allows. Markets with measured flow come first, fastest first.
+One block per market (the mirrored short side of a Polymarket US market is the
+same book and is not repeated): the median size waiting at the best bid and
+ask, contracts traded per hour against each side, how often the spread is 1, 2
+or 3+ ticks (and its median in cents, since a 1-cent spread is 10 ticks on a
+0.001-tick market), and the hours until a 20-contract order (`--size`) would
+fill if it joins the back of the queue, or if it prices one tick better, using
+only trading seen while the spread allowed that. A maker needs both sides to
+fill, so markets are ranked by the slower side.
 
-Flow comes from trade prints where the tape has them (streamed markets), from
-the venue's traded-volume counter (Polymarket US tapes recorded from
-2026-10-18), or otherwise from size that left the best price between snapshots.
-That last source counts cancellations as trades, so those rows show fill times
-as lower bounds (`>=`).
+Flow comes from trade prints where the tape has them (streamed markets), taken
+over the stretch the prints cover; or from the venue's traded-volume counter
+(Polymarket US tapes recorded from 2026-10-18), over the time it was recorded,
+calibrated against trade prints where both exist. Markets with fewer than 5
+prints are shown but not ranked. Markets with no trade data at all show only
+book churn, which is not trading, and get no fill time. Reports open tapes
+read-only and never modify them.
 
 ## Measuring whether it works: markouts
 

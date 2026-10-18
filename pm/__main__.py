@@ -58,6 +58,13 @@ def main(argv: list[str] | None = None) -> int:
     sb.add_argument("--db", help="replay this SQLite file instead of the venue's tape (e.g. data/pm.sqlite)")
 
     args = p.parse_args(argv)
+    # A Windows console or redirected file may use a code page that cannot show every market name: replace such
+    # characters instead of crashing.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     cfg = Config.load(args.config)
     if args.venue:
         cfg.venue = "polymarket_us" if args.venue == "us" else "polymarket"
@@ -344,14 +351,15 @@ def _measure(cfg: Config, args) -> int:
         print(f"No tape at {path}. Run the bot on this venue first, or pass --db <file>.")
         return 1
     print(f"tape: {path}")
-    s = Store(path)
+    s = Store(path, readonly=True)
     try:
         rows, info = measure_tape(s, since_hours=args.since_hours, size=args.size)
     finally:
         s.close()
+    if args.csv:                                   # first, so a printing problem can never cost the file
+        write_csv(rows, args.csv)
     print_report(rows, info, top=args.top)
     if args.csv:
-        write_csv(rows, args.csv)
         print(f"\nall {len(rows)} rows written to {args.csv}")
     return 0
 
@@ -364,7 +372,7 @@ def _status(cfg: Config, since_hours: float = 0.0, db: str | None = None) -> int
         print(f"No tape at {path}. Run the bot on this venue first, or pass --db <file>.")
         return 1
     print(f"tape: {path}")
-    s = Store(path)
+    s = Store(path, readonly=True)
     try:
         summary = s.summary(since_hours=since_hours)
     finally:

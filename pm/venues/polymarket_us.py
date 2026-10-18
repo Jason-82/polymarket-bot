@@ -283,7 +283,7 @@ def books_from_us(slug: str, data: dict[str, Any], ts: Optional[float] = None) -
     traded = stats.get("sharesTraded")
     if traded not in (None, ""):
         try:
-            long_book.traded_total = short_book.traded_total = D(traded)
+            long_book.traded_total = short_book.traded_total = _amount(traded)   # plain string or {"value": ...}
         except Exception:
             pass
     return long_book, short_book
@@ -368,6 +368,17 @@ class USMarketData:
         self._ws = None
         self.connected = False
         self.messages = 0
+        self._last_traded: dict[str, Decimal] = {}
+
+    def _emit_books(self, slug: str, payload: dict[str, Any]) -> None:
+        """Books from one payload. A payload without the volume counter carries the last known value forward, so
+        the tape never has holes that would hide traded volume from `pm measure`."""
+        for b in books_from_us(slug, payload):
+            if b.traded_total is None:
+                b.traded_total = self._last_traded.get(slug)
+            elif b.token_id.endswith(LONG):
+                self._last_traded[slug] = b.traded_total
+            self._on_book(b)
 
     def start(self, slugs: list[str]) -> None:
         self._slugs = list(slugs)
@@ -414,8 +425,7 @@ class USMarketData:
                     log.debug("us_book_poll_failed", slug=slug, error=str(e)[:120])
                     return
                 self.messages += 1
-                for b in books_from_us(slug, data or {}):
-                    self._on_book(b)
+                self._emit_books(slug, data or {})
 
         while not self._stop.is_set():
             t0 = time.time()
@@ -468,8 +478,7 @@ class USMarketData:
         if not slug:
             return
         self.messages += 1
-        for b in books_from_us(slug, payload):
-            self._on_book(b)
+        self._emit_books(slug, payload)
 
     def _on_trade_msg(self, msg: dict[str, Any]) -> None:
         payload = msg.get("trade") or {}

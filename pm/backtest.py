@@ -53,7 +53,7 @@ class ReplayClock:
 
 
 async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) -> int:
-    tape = Store(path)
+    tape = Store(path, readonly=True)
     scratch = Store(":memory:")
     try:
         markets = tape.load_markets()
@@ -80,6 +80,11 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
         rows_by_token: dict[str, list[float]] = {}
         for r in books:
             rows_by_token.setdefault(r[1], []).append(r[0])
+        # Streamed books (those with trade prints) write rows only when they change, so a quiet spell is not a
+        # dead feed: they stay current up to STREAM_LIVE_GAP_S while the recorder was running (same rule as
+        # `pm measure`). REST-polled books write every ~10 s, so for them a 5-minute silence does mean stale.
+        streamed = {r[1] for r in trades}
+        alive = [(a, b) for a, b in tape._alive_spans() if b >= since]
         clock = ReplayClock(books[0][0])
         withdrawals = Withdrawals()
         pf = Portfolio(cash=cfg.execution.paper_starting_cash_usd)
@@ -97,7 +102,7 @@ async def _run(cfg: Config, since_hours: float, tick_seconds: float, path: str) 
         for ts, kind, row in events:
             while ts >= next_tick:
                 clock.ts = next_tick
-                _touch_live_books(ms, rows_by_token, next_tick)
+                _touch_live_books(ms, rows_by_token, next_tick, streamed, alive)
                 await _tick(next_tick, ms, pf, px, oms, risk, strategies, withdrawals)
                 n_ticks += 1
                 next_tick += tick_seconds
@@ -164,9 +169,11 @@ def print_markouts(mk: dict[str, Any]) -> None:
 
 
 LIVE_GAP_S = 300.0
+STREAM_LIVE_GAP_S = 3600.0
 
 
-def _touch_live_books(ms: MarketState, rows_by_token: dict[str, list[float]], ts: float) -> None:
+def _touch_live_books(ms: MarketState, rows_by_token: dict[str, list[float]], ts: float,
+                      streamed: set[str] | None = None, alive: list[tuple[float, float]] | None = None) -> None:
     for tok, b in ms.books.items():
         rows = rows_by_token.get(tok)
         if not rows:
@@ -174,7 +181,11 @@ def _touch_live_books(ms: MarketState, rows_by_token: dict[str, list[float]], ts
         i = bisect.bisect_right(rows, ts)
         if i == 0 or i >= len(rows):
             continue                                   # before its first row, or after its last: no evidence
-        if rows[i] - rows[i - 1] <= LIVE_GAP_S:
+        gap = rows[i] - rows[i - 1]
+        if gap <= LIVE_GAP_S:
+            b.ts = ts
+        elif (streamed and tok in streamed and gap <= STREAM_LIVE_GAP_S and alive is not None
+              and Store._within_one_span(alive, rows[i - 1], rows[i])):
             b.ts = ts
 
 

@@ -41,7 +41,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (
   condition_id TEXT PRIMARY KEY, question TEXT, slug TEXT, json TEXT, updated_ts REAL);
 CREATE TABLE IF NOT EXISTS books (
-  ts REAL, token_id TEXT, best_bid TEXT, best_ask TEXT, bid_sz TEXT, ask_sz TEXT, top TEXT);
+  ts REAL, token_id TEXT, best_bid TEXT, best_ask TEXT, bid_sz TEXT, ask_sz TEXT, top TEXT, traded_total TEXT);
 CREATE INDEX IF NOT EXISTS ix_books_ts ON books(ts);
 CREATE INDEX IF NOT EXISTS ix_books_tok ON books(token_id, ts);
 CREATE TABLE IF NOT EXISTS trades (ts REAL, token_id TEXT, price TEXT, size TEXT, side TEXT);
@@ -63,16 +63,30 @@ CREATE TABLE IF NOT EXISTS events (ts REAL, kind TEXT, detail TEXT);
 
 
 class Store:
-    def __init__(self, path: str | Path, book_snapshot_interval: float = 0.5, book_heartbeat: float = 10.0):
+    def __init__(self, path: str | Path, book_snapshot_interval: float = 0.5, book_heartbeat: float = 10.0,
+                 readonly: bool = False):
+        """readonly: for reports (status, measure, backtest). Never changes the file (no schema creation, no
+        migration), so an archived tape stays as it was and a running bot's tape is not locked."""
         p = Path(path)
-        if str(p) != ":memory:":
-            p.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(p), isolation_level=None, check_same_thread=False, timeout=10)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=NORMAL")
-        self._db.executescript(SCHEMA)
-        if "traded_total" not in {r[1] for r in self._db.execute("PRAGMA table_info(books)")}:
-            self._db.execute("ALTER TABLE books ADD COLUMN traded_total TEXT")   # tapes from before 2026-10-18
+        self.readonly = readonly and str(p) != ":memory:"
+        self._db = None
+        if self.readonly:
+            try:
+                self._db = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None,
+                                           check_same_thread=False, timeout=10)
+                self._db.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            except sqlite3.Error:
+                self._db = None
+                self.readonly = False                 # e.g. a WAL tape whose side files cannot be created read-only
+        if self._db is None:
+            if str(p) != ":memory:":
+                p.parent.mkdir(parents=True, exist_ok=True)
+            self._db = sqlite3.connect(str(p), isolation_level=None, check_same_thread=False, timeout=10)
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA synchronous=NORMAL")
+            self._db.executescript(SCHEMA)
+            if "traded_total" not in self.book_columns():
+                self._db.execute("ALTER TABLE books ADD COLUMN traded_total TEXT")   # tapes from before 2026-10-18
         self._buf: list[tuple[str, tuple]] = []
         self._last_book_ts: dict[str, float] = {}
         self._last_book_key: dict[str, tuple] = {}
@@ -90,6 +104,8 @@ class Store:
             self.flush()
 
     def flush(self) -> None:
+        if self.readonly:
+            return
         self._drain_pending_books()
         if not self._buf:
             return
@@ -103,6 +119,9 @@ class Store:
             self._db.execute("ROLLBACK")
             raise
         self._last_flush = time.time()
+
+    def book_columns(self) -> set[str]:
+        return {r[1] for r in self._db.execute("PRAGMA table_info(books)")}
 
     def close(self) -> None:
         self.flush()

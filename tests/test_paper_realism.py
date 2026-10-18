@@ -562,3 +562,23 @@ def test_requoted_closer_releases_its_old_claim_on_held_shares():
     rep = RiskGate(RiskConfig(max_notional_per_market_usd=D(15), min_cash_reserve_usd=D(0)), Mode.PAPER).evaluate(
         [requote], ctx, True)
     assert [(i.price, i.reason) for i in rep.accepted] == [(D("0.50"), "")]   # still a closer: charged nothing
+
+
+def test_backtest_keeps_a_quiet_streamed_book_current_while_the_recorder_runs():
+    """A streamed book is silent while unchanged; on the user's tape that showed up as 1,330 'book stale'
+    withdrawals. With trade prints (streamed) and the recorder running, a 20-minute silence is still current."""
+    from pm.backtest import _touch_live_books
+    from pm.state import MarketState
+    ms = MarketState()
+    ms.set_markets([mk_market()])
+    b = mk_book("Y1", "0.40", "0.42", ts=100.0)
+    ms.update_book(b)
+    rows = {"Y1": [100.0, 1300.0]}                                     # quiet 20 minutes
+    alive = [(0.0, 5000.0)]
+    _touch_live_books(ms, rows, 700.0, streamed=set(), alive=alive)
+    assert b.ts == 100.0                                               # polled book: stale after 5 minutes
+    _touch_live_books(ms, rows, 700.0, streamed={"Y1"}, alive=alive)
+    assert b.ts == 700.0                                               # streamed book: still current
+    b.ts = 100.0
+    _touch_live_books(ms, rows, 700.0, streamed={"Y1"}, alive=[(0.0, 600.0), (900.0, 5000.0)])
+    assert b.ts == 100.0                                               # the recorder itself stopped: stale
