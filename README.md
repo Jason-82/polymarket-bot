@@ -102,9 +102,31 @@ python -m pm --venue us run --mode paper
 
 Keys come from `polymarket.us/developer` and go in `.env` as `PM_US_KEY_ID`
 and `PM_US_SECRET_KEY`. The venue caps streaming subscriptions
-(`venue_us.ws_max_markets`); other markets are REST-polled.
+(`venue_us.ws_max_markets`): the first markets of the universe are streamed
+and keep their subscription across universe refreshes while they stay in it;
+the others are REST-polled, and so are the streamed ones while the stream is
+down. The volume counter comes from the bbo endpoint (the REST book reply does
+not carry it) every `venue_us.volume_poll_seconds`.
 
-## Which markets can a small order actually fill in? `measure`
+## Recording every busy market, sports included: `record`
+
+```bash
+python -m pm --venue us record                       # leave it running about a day; Ctrl+C to stop
+python -m pm --venue us measure --db data/measure_polymarket_us.sqlite --csv data/measure.csv
+```
+
+`record` trades nothing. It watches up to 200 of the busiest Polymarket US
+markets (events in the venue's volume order, at most 5 markets per event, sports
+included, no end-date, spread or depth filter) and writes their books, trade
+prints and the venue's traded-volume counter to its own tape,
+`data/measure_polymarket_us.sqlite`, with its own log next to it. The `record:`
+block of `config.yaml` sets the numbers. Books are polled every 30 s, the
+volume counter every 60 s, and the 10 busiest markets are streamed, about 10
+requests a second in all (the venue allows about 20 per IP, and every
+market-data request goes through a limit of 16 a second). Do not run the paper
+bot at the same time: they share that limit. The tape grows about 0.5-1 GB a
+day.
+
 
 ```bash
 python -m pm --venue us measure                      # the venue's current tape
@@ -120,13 +142,19 @@ fill if it joins the back of the queue, or if it prices one tick better, using
 only trading seen while the spread allowed that. A maker needs both sides to
 fill, so markets are ranked by the slower side.
 
-Flow comes from trade prints where the tape has them (streamed markets), taken
-over the stretch the prints cover but never less than an hour; or from the
-venue's traded-volume counter (Polymarket US tapes recorded from 2026-10-18),
-over the time it was recorded, calibrated against trade prints where both
-exist. One taker order that sweeps several resting orders prints several
-trades at once, so prints on the same side less than a second apart count as
-one burst. Markets with fewer than 5 bursts are shown but not ranked. Markets with no trade data at all show only
+Flow comes from the venue's traded-volume counter (Polymarket US tapes recorded
+from 2026-10-18), over the time it was recorded, calibrated against trade
+prints on streamed markets that have both. The counter has no side: the split
+between sellers and buyers comes from the market's trade prints, or is taken
+as even where there are none ("sides assumed even"), which is the best case
+for a maker. A counter that goes down is not counted; one that goes down 3 or
+more times is not used. Without the counter, flow comes from trade prints,
+taken over the stretch the prints cover but never less than an hour. One taker
+order that sweeps several resting orders prints several trades at once, so
+prints on the same side less than a second apart count as one burst. Markets
+with fewer than 5 bursts are shown but not ranked. The summary counts the
+markets that fill both sides within 1 hour and within 24 hours, with sports
+shown separately. Markets with no trade data at all show only
 book churn, which is not trading, and get no fill time. Reports open tapes
 read-only and never modify them.
 

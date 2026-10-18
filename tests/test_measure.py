@@ -197,8 +197,8 @@ def test_counter_holes_and_resets_keep_the_volume():
     for k in range(361):
         t = 10 * k
         if k == 180:
-            counter = 900                                       # restarted from zero, 900 traded since
-            true_volume += 900
+            counter = 400                                       # restarted from zero (below half of 995), 400 since
+            true_volume += 400
         elif k > 0:
             counter += 5
             true_volume += 5
@@ -207,6 +207,25 @@ def test_counter_holes_and_resets_keep_the_volume():
     r = _one(rows)
     assert r.flow_source == "venue"
     assert r.sell_flow_h + r.buy_flow_h == pytest.approx(true_volume, rel=0.02)
+    s.close()
+
+
+def test_a_counter_that_goes_down_is_not_counted_and_three_drops_retire_it():
+    ms = [_us("a"), _us("b")]
+    s = _tape(ms, hours=1)
+    for slug, dips in (("a", (100,)), ("b", (100, 150, 200))):
+        counter = 10000
+        for k in range(361):
+            counter += 5
+            if k in dips:
+                counter -= 40                                   # a rolling window dropping old trades, not a restart
+            _row(s, 10 * k, f"{slug}|L", "0.50", "0.52", 100, 100, str(counter))
+    rows, info = measure_tape(s)
+    a, b = _one(rows, "a|L"), _one(rows, "b|L")
+    assert a.counter_drops == 1 and a.flow_source == "venue"
+    assert a.sell_flow_h + a.buy_flow_h == pytest.approx(359 * 5, rel=0.01)   # the dip is neither added nor taken
+    assert b.counter_drops == 3 and b.flow_source == "book" and math.isinf(b.join_round_trip_h)
+    assert info["drop_markets"] == 2 and info["drops"] == 4 and info["unusable_counters"] == 1
     s.close()
 
 
@@ -230,6 +249,89 @@ def test_counter_is_calibrated_against_prints_on_streamed_markets():
     c = _one(rows, "c|L")
     assert c.flow_source == "venue"
     assert c.sell_flow_h == pytest.approx(72000 / 2 / 2, rel=0.03)    # counter/h, de-doubled, split by side
+    s.close()
+
+
+# ------------------------------------------------------------------ the counter gives the total, prints the sides
+
+def _sport(slug):
+    return market_from_us({"slug": slug, "title": slug.upper(), "outcomes": "[\"Yes\",\"No\"]",
+                           "feeCoefficient": 0.06, "minimumTradeQty": 1, "orderPriceMinTickSize": 0.01,
+                           "marketType": "moneyline", "active": True},
+                          {"slug": "g", "title": "Knicks vs Celtics", "category": "sports"})
+
+
+def _calibrated_tape(extra, hours=2):
+    """Two streamed markets whose counter equals their prints (ratio 1), plus `extra`."""
+    ms = [_us("a"), _us("b")] + list(extra)
+    s = _tape(ms, hours=hours)
+    for slug in ("a", "b"):
+        counter = 0
+        for k in range(int(hours * 360) + 1):
+            t = 10 * k
+            if k % 6 == 0 and 0 < k < hours * 360:
+                s.trade(f"{slug}|L", D("0.50"), D(30), Side.SELL, t - 1)
+                s.trade(f"{slug}|L", D("0.51"), D(10), Side.BUY, t - 2)
+                counter += 40
+            _row(s, t, f"{slug}|L", "0.50", "0.51", 100, 100, str(counter))
+    return s
+
+
+def test_calibrated_counter_gives_the_total_and_prints_the_split():
+    c = _us("c")
+    s = _calibrated_tape([c])
+    counter = 0
+    for k in range(721):                                        # 2 h of counter, 720/h in all
+        counter += 2
+        _row(s, 10 * k, "c|L", "0.50", "0.51", 100, 100, str(counter))
+    for k in range(6):                                          # streamed only in the first half hour: buyers only
+        s.trade("c|L", D("0.51"), D(10), Side.BUY, 60 + k * 300.0)
+    rows, info = measure_tape(s)
+    assert info["counter_ratio"] == pytest.approx(1.0, rel=0.02)
+    a, r = _one(rows, "a|L"), _one(rows, "c|L")
+    assert a.flow_source == "venue" and a.side_source == "prints" and a.sell_share == pytest.approx(0.75)
+    assert a.sell_flow_h == pytest.approx(3 * a.buy_flow_h, rel=0.01)
+    assert r.flow_source == "venue" and r.side_source == "prints"
+    assert r.flow_hours == pytest.approx(2.0, rel=0.01)         # the counter's time, not the half hour of prints
+    assert r.buy_flow_h == pytest.approx(720, rel=0.02) and r.sell_flow_h == 0
+    assert math.isinf(r.fill_join_bid_h) and math.isinf(r.join_round_trip_h)   # nobody sells: no round trip
+    s.close()
+
+
+def test_uncalibrated_counter_leaves_printed_markets_on_their_prints():
+    m = _us()
+    s = _tape([m], hours=2)
+    counter = 0
+    for k in range(721):
+        counter += 50                                           # unknown scale: much bigger than the prints
+        _row(s, 10 * k, "x|L", "0.50", "0.51", 100, 100, str(counter))
+    for k in range(20):
+        s.trade("x|L", D("0.50"), D(10), Side.SELL, 100 + k * 360.0)
+    rows, info = measure_tape(s)
+    r = _one(rows)
+    assert info["counter_ratio"] is None and r.flow_source == "trades"
+    assert r.sell_flow_h == pytest.approx(200 / 2.0, rel=0.1)
+    s.close()
+
+
+def test_report_counts_sports_and_marks_even_splits_as_the_best_case(capsys):
+    game = _sport("nyk-bos-ml")
+    s = _calibrated_tape([game])
+    counter = 0
+    for k in range(721):
+        counter += 200                                          # 72,000/h, no prints: split evenly
+        _row(s, 10 * k, "nyk-bos-ml|L", "0.50", "0.51", 100, 100, str(counter))
+    rows, info = measure_tape(s)
+    g = _one(rows, "nyk-bos-ml|L")
+    assert g.sports and g.side_source == "even" and g.sell_flow_h == pytest.approx(36000, rel=0.02)
+    assert g.join_round_trip_h < 1
+    print_report(rows, info)
+    out = capsys.readouterr().out
+    text = " ".join(out.split())                                # the summary is wrapped at 79 columns
+    assert "3 markets observed (1 sports); 3 with the venue's volume counter, 2 with trade prints" in text
+    assert "sides assumed even" in text and "best case" in text and "nyk-bos-ml tick 0.01" in text
+    assert "within 1h in 3 (1 sports)" in text and "1 of them has no trade prints" in text
+    assert all(len(line) <= 79 for line in out.splitlines())
     s.close()
 
 

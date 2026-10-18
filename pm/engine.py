@@ -39,7 +39,10 @@ class Engine:
         self.pf = Portfolio(cash=cfg.execution.paper_starting_cash_usd if self.mode is Mode.PAPER else ZERO,
                             # live positions come from the venue; never invent an opposite position locally
                             open_mirror_on_excess_sell=self.mode is not Mode.LIVE)
-        self.store = Store(cfg.db_file)
+        r = cfg.record
+        # `pm record` watches ~200 markets: fewer rows per market keep its tape small
+        self.store = (Store(cfg.db_file, book_snapshot_interval=r.book_snapshot_seconds,
+                            book_heartbeat=r.book_heartbeat_seconds) if cfg.recording else Store(cfg.db_file))
         self.venue: Venue = make_venue(cfg)
         self.strategies: list[Strategy] = build_strategies(cfg.strategies, self.venue.name)
         self.risk = RiskGate(cfg.risk, self.mode)

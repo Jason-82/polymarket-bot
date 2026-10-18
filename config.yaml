@@ -17,6 +17,18 @@ venue_us:
   expand_concurrency: 8
   prefilter_max_spread: 0.15    # from the listing's quoted bid/ask, before fetching books
   prefilter_band: [0.05, 0.95]
+  volume_poll_seconds: 60       # the venue's traded-volume counter for every market (REST bbo); 0 = off
+  max_requests_per_second: 16   # all market-data REST calls together; the venue allows about 20/s per IP
+
+record:                         # python -m pm --venue us record: watch many markets, trade nothing, for `measure`
+  db_path: data/measure_{venue}.sqlite   # its own tape, never mixed with the paper bot's
+  max_markets: 200              # watched at once, busiest events first (the venue lists events by volume)
+  max_markets_per_event: 5      # one game lists many markets (winner, spreads, totals)
+  max_events: 400               # events listed per universe refresh
+  exclude_tags: []              # sports included; e.g. [crypto] to leave a category out
+  book_poll_seconds: 30         # REST book cadence: 200 books / 30 s + 200 counters / 60 s = 10 requests/s
+  book_snapshot_seconds: 2      # at most one changed-book row per market every 2 s...
+  book_heartbeat_seconds: 60    # ...and one unchanged row a minute: the tape grows about 0.5-1 GB a day
 tick_seconds: 1.0      # strategy evaluation cadence
 db_path: data/pm_{venue}.sqlite   # one tape per venue: data/pm_polymarket.sqlite, data/pm_polymarket_us.sqlite
 log_level: INFO

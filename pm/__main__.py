@@ -3,6 +3,7 @@
   probe     connectivity, geoblock, fee info and a live book for one market
   scan      one-shot structural scan across the universe (no trading)
   run       run the engine (mode from config.yaml or --mode)
+  record    Polymarket US: watch ~200 of the busiest markets, sports included, trade nothing (for `measure`)
   status    summarise the SQLite tape
   measure   per-market queue depth vs trading flow: can a small order fill?
   backtest  replay the recorded tape through the strategies
@@ -41,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
     sr = sub.add_parser("run")
     sr.add_argument("--mode", choices=[m.value for m in Mode])
 
+    sub.add_parser("record", help="Polymarket US: watch many markets (sports included), trade nothing; "
+                                  "then run `measure` on its tape")
+
     st = sub.add_parser("status")
     st.add_argument("--since-hours", type=float, default=0.0, help="restrict markouts/equity to this window")
     st.add_argument("--db", help="read this SQLite file instead of the venue's tape (e.g. data/pm.sqlite)")
@@ -71,6 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     cfg.venue = canonical_venue(cfg.venue)
     if args.cmd == "run" and args.mode:
         cfg.mode = Mode(args.mode)
+    if args.cmd == "record":
+        if cfg.venue != "polymarket_us":
+            print("record is for Polymarket US: run  python -m pm --venue us record")
+            return 2
+        cfg.as_recorder()                      # read-only, no strategies, its own tape and log
     tape = Path(cfg.db_file)
     if args.cmd in ("backtest", "status", "measure"):
         # Reports: print only the report, and never write into the log file of a bot that may be running.
@@ -90,6 +99,12 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_scan(cfg))
         if args.cmd == "run":
             return _run(cfg)
+        if args.cmd == "record":
+            r = cfg.record
+            return _run(cfg, banner=(
+                f"Recording Polymarket US for `measure`: up to {r.max_markets} of the busiest markets "
+                f"({'sports included' if 'sports' not in {t.lower() for t in r.exclude_tags} else 'no sports'}), "
+                f"nothing is traded.\ntape: {cfg.db_file}   (Ctrl+C to stop; leave it running about a day)"))
         if args.cmd == "status":
             return _status(cfg, args.since_hours, args.db)
         if args.cmd == "measure":
@@ -316,14 +331,14 @@ async def _scan_us(cfg: Config) -> int:
         await v.stop()
 
 
-def _run(cfg: Config) -> int:
+def _run(cfg: Config, banner: str | None = None) -> int:
     from .engine import Engine
 
     if cfg.mode is Mode.LIVE and not cfg.secrets.live_trading_ack:
         print("Refusing to start LIVE: set LIVE_TRADING=yes in .env after reading README 'Going live'.")
         return 2
-    print(f"venue={cfg.venue} mode={cfg.mode.value}  (Ctrl+C to stop; create a file named "
-          f"{cfg.risk.kill_switch_file} to halt without stopping)")
+    print(banner or f"venue={cfg.venue} mode={cfg.mode.value}  (Ctrl+C to stop; create a file named "
+                    f"{cfg.risk.kill_switch_file} to halt without stopping)")
     engine = Engine(cfg)
 
     async def _main():

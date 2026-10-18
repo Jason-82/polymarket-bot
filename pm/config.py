@@ -71,6 +71,21 @@ class VenueUSConfig:
     expand_concurrency: int = 8
     prefilter_max_spread: Decimal = Decimal("0.15")
     prefilter_band: list = field(default_factory=lambda: [Decimal("0.05"), Decimal("0.95")])
+    volume_poll_seconds: float = 60.0     # traded-volume counter (REST bbo) for every market; 0 = off
+    max_requests_per_second: float = 16.0  # all market-data REST calls together; the venue allows ~20/s per IP
+
+
+@dataclass
+class RecordConfig:
+    """`pm record`: watch many markets and trade nothing, so `pm measure` can say where a small order fills."""
+    db_path: str = "data/measure_{venue}.sqlite"   # its own tape: never mixed with the paper bot's
+    max_markets: int = 200            # watched at once, busiest events first (the venue lists events by volume)
+    max_markets_per_event: int = 5    # one game lists many markets (winner, spreads, totals)
+    max_events: int = 400             # events listed per universe refresh
+    exclude_tags: list[str] = field(default_factory=list)   # sports are included
+    book_poll_seconds: float = 30.0   # REST book cadence: queue size and spread are sampled, not traded on
+    book_snapshot_seconds: float = 2.0    # at most one changed-book row per market every 2 s
+    book_heartbeat_seconds: float = 60.0  # and one unchanged row a minute (the tape grows ~0.5-1 GB a day)
 
 
 @dataclass
@@ -123,8 +138,10 @@ class Config:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
     venue_us: VenueUSConfig = field(default_factory=VenueUSConfig)
+    record: RecordConfig = field(default_factory=RecordConfig)
     strategies: dict[str, dict[str, Any]] = field(default_factory=dict)
     secrets: Secrets = field(default_factory=Secrets)
+    recording: bool = False        # set by `pm record`, never by config.yaml
 
     # Public endpoints
     gamma_url: str = "https://gamma-api.polymarket.com"
@@ -152,9 +169,22 @@ class Config:
         cfg.execution = _build(ExecutionConfig, raw.get("execution") or {})
         cfg.alerts = _build(AlertsConfig, raw.get("alerts") or {})
         cfg.venue_us = _build(VenueUSConfig, raw.get("venue_us") or {})
+        cfg.record = _build(RecordConfig, raw.get("record") or {})
         cfg.strategies = dict(raw.get("strategies") or {})
         cfg.secrets = Secrets.from_env()
         return cfg
+
+    def as_recorder(self) -> "Config":
+        """The `pm record` profile: read-only, no strategies, its own tape, the wide universe of `record:`."""
+        r = self.record
+        self.recording = True
+        self.mode = Mode.READ_ONLY
+        self.db_path = r.db_path
+        self.strategies = {}
+        self.universe.exclude_tags = list(r.exclude_tags)
+        self.universe.max_markets = r.max_markets
+        self.venue_us.book_poll_seconds = r.book_poll_seconds
+        return self
 
     def strategy(self, name: str) -> dict[str, Any]:
         return dict(self.strategies.get(name) or {})
