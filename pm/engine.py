@@ -186,7 +186,9 @@ class Engine:
                 if t0 - last_access > ACCESS_INTERVAL:
                     await self._check_access()
                     last_access = t0
-                if t0 - last_universe > self.cfg.universe.refresh_seconds:
+                # an empty universe (the first listing failed) is retried every minute, not every refresh
+                refresh = self.cfg.universe.refresh_seconds if self.ms.markets else min(60, self.cfg.universe.refresh_seconds)
+                if t0 - last_universe > refresh:
                     await self._refresh_universe()
                     await self.venue.set_feed_tokens(self.ms.token_ids)
                     last_universe = t0

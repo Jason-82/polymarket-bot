@@ -621,3 +621,30 @@ def test_record_banner_prints_the_tape_path_with_forward_slashes(monkeypatch, tm
     assert f"tape: data/{tmp_path.name}_m_polymarket_us.sqlite" in seen["banner"]
     import os
     os.remove(f"data/{tmp_path.name}_m_polymarket_us.sqlite.lock")
+
+
+async def test_an_empty_universe_is_retried_within_a_minute(tmp_path, monkeypatch):
+    from pm.engine import Engine
+    cfg = Config()
+    cfg.venue = "polymarket_us"
+    cfg.as_recorder()
+    cfg.db_path = str(tmp_path / "m_{venue}.sqlite")
+    cfg.tick_seconds = 0.01
+    cfg.venue_us.max_requests_per_second = 0
+    e = Engine(cfg)
+    calls = []
+
+    async def failing():
+        calls.append(1)
+        raise RuntimeError("403 Forbidden")
+    e.venue.select_universe = failing
+    clock = {"t": 1000.0}
+    import pm.engine
+    monkeypatch.setattr(pm.engine.time, "time", lambda: clock["t"])
+    task = asyncio.create_task(e.run())
+    await asyncio.sleep(0.05)
+    clock["t"] += 61                                                    # a minute later, not ten
+    await asyncio.sleep(0.05)
+    e.request_stop()
+    await task
+    assert len(calls) >= 2
