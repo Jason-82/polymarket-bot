@@ -54,6 +54,7 @@ US_TAKER_RATE = Decimal("0.06")
 US_MAKER_REBATE_FLAT_2026_07 = Decimal("0.0125")   # the pre-2026-10-19 flat rebate, kept for reference/tests
 US_TICK = Decimal("0.01")
 MIN_POLL_WAIT_S = 0.5      # the REST poll loop never spins faster than this
+STREAM_SILENT_S = 120.0    # a streamed market silent this long is REST-polled as well
 
 
 def make_client(cfg: Config, key_id: Optional[str], secret_key: Optional[str], timeout: Optional[float] = None):
@@ -287,6 +288,8 @@ def market_from_us(row: dict[str, Any], event: Optional[dict[str, Any]] = None,
 def books_from_us(slug: str, data: dict[str, Any], ts: Optional[float] = None) -> tuple[Book, Book]:
     """Long book from the venue payload, plus the mirrored short book."""
     ts = ts or time.time()
+    if not isinstance(data, dict):
+        data = {}
     if isinstance(data.get("marketData"), dict):      # REST wraps the payload; the WebSocket does not
         data = data["marketData"]
     bids = [Level(_amount(l.get("px")), D(l.get("qty"))) for l in data.get("bids") or []]
@@ -304,33 +307,45 @@ def books_from_us(slug: str, data: dict[str, Any], ts: Optional[float] = None) -
     return long_book, short_book
 
 
-def traded_total_from_us(data: dict[str, Any]) -> Optional[Decimal]:
+def traded_total_from_us(data: Any) -> Optional[Decimal]:
     """The venue's traded-volume counter from a bbo, book or stream payload (`sharesTraded`, top level or in
-    `stats`), or None. The REST book reply does not carry it; GET /v1/markets/{slug}/bbo does."""
+    `stats`), or None. The REST book reply does not carry it; GET /v1/markets/{slug}/bbo does. An empty value is
+    None, never 0: a 0 would read as the counter restarting."""
+    if not isinstance(data, dict):
+        return None
     if isinstance(data.get("marketData"), dict):
         data = data["marketData"]
     v = data.get("sharesTraded")
     if v in (None, "") and isinstance(data.get("stats"), dict):
         v = data["stats"].get("sharesTraded")
-    if v in (None, ""):
+    if isinstance(v, dict):
+        v = v.get("value")
+    if v is None or isinstance(v, bool) or (isinstance(v, str) and not v.strip()):
         return None
     try:
-        return _amount(v)
+        out = Decimal(str(v).strip())
     except Exception:
         return None
+    return out if out.is_finite() and out >= 0 else None
 
 
 def trades_from_us(slug: str, payload: dict[str, Any]) -> list[Trade]:
-    """A long trade at p is also a short trade at 1-p with the opposite aggressor side."""
+    """A long trade at p is also a short trade at 1-p with the opposite aggressor side.
+
+    The taker's intent decides: buying long or selling short lifts the long ask (BUY), selling long or buying
+    short hits the long bid (SELL). The side field is used only when there is no intent, because it may be given
+    in the short contract's own terms (buying NO reported as a BUY)."""
     price = _amount(payload.get("price"))
     qty = _amount(payload.get("quantity") or payload.get("qty") or 0)
     taker = payload.get("taker") or {}
     side_s = str(taker.get("side") or "").upper()
     intent = str(taker.get("intent") or "").upper()
-    if "BUY" in side_s or intent.endswith("BUY_LONG") or intent.endswith("SELL_SHORT"):
+    if intent.endswith(("BUY_LONG", "SELL_SHORT")):
         side = Side.BUY
-    else:
+    elif intent.endswith(("SELL_LONG", "BUY_SHORT")):
         side = Side.SELL
+    else:
+        side = Side.BUY if "BUY" in side_s else Side.SELL
     ts = time.time()
     t = _dt(payload.get("tradeTime"))
     if t is not None:
@@ -387,6 +402,11 @@ def positions_from_us(payload: dict[str, Any]) -> dict[str, tuple[Decimal, Decim
 # ------------------------------------------------------------------ market data
 
 class USMarketData:
+    """Books for the universe: the first ws_max_markets markets on the authenticated stream (with trade prints),
+    the rest from REST every book_poll_seconds, and the traded-volume counter of every market from REST bbo every
+    volume_poll_seconds. Every request goes through one Throttle. Nothing a payload or a handler raises may stop
+    a loop: a recorder runs unattended for a day."""
+
     def __init__(self, cfg: Config, public_client, on_book: BookHandler, on_trade: TradeHandler,
                  throttle: Optional[Throttle] = None):
         self.cfg = cfg
@@ -398,28 +418,55 @@ class USMarketData:
         self._ws_slugs: list[str] = []
         self._tasks: list[asyncio.Task] = []
         self._poll_task: Optional[asyncio.Task] = None
+        self._volume_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._ws = None
         self.connected = False
         self.messages = 0
-        self._last_traded: dict[str, Decimal] = {}
-        self._last_volume_poll = 0.0
+        self.last_message_ts = 0.0
+        self._last_traded: dict[str, tuple[Decimal, float]] = {}   # slug -> (counter, wall time it was read)
+        self._last_stream_ts: dict[str, float] = {}
+        self._prev_volume: dict[str, Decimal] = {}
         self._volume_rounds = 0
+        self._warned_still = False
+        self._last_warn: dict[str, float] = {}
+
+    # ---- helpers
+    def _carry_max_s(self) -> float:
+        """How long a counter value may ride on later books. Older than this (a gap: the market left the universe,
+        the network dropped, the computer slept) it is not carried, or the volume traded during the gap would be
+        counted as traded in the first minute after it."""
+        return max(150.0, 2.5 * float(self.cfg.venue_us.volume_poll_seconds or 0))
+
+    def _warn(self, key: str, every_s: float, event: str, **kw: Any) -> None:
+        now = time.time()
+        if now - self._last_warn.get(key, 0.0) >= every_s:
+            self._last_warn[key] = now
+            log.warning(event, **kw)
+
+    def stream_fresh(self, slug: str, now: Optional[float] = None) -> bool:
+        """A streamed market counts as streamed while the stream delivered for it in the last STREAM_SILENT_S; a
+        socket that is open but silent for it (a rejected subscription) leaves it to the REST poll."""
+        now = time.time() if now is None else now
+        return self.connected and slug in self._ws_slugs and now - self._last_stream_ts.get(slug, 0.0) <= STREAM_SILENT_S
 
     def _emit_books(self, slug: str, payload: dict[str, Any]) -> None:
-        """Books from one payload. A payload without the volume counter carries the last known value forward, so
-        the tape never has holes that would hide traded volume from `pm measure`."""
+        """Books from one payload. A payload without the volume counter carries the last value forward while it is
+        recent (_carry_max_s), so short holes do not hide traded volume from `pm measure` and gaps do not invent it."""
         for b in books_from_us(slug, payload):
             if b.traded_total is None:
-                b.traded_total = self._last_traded.get(slug)
+                last = self._last_traded.get(slug)
+                if last is not None and b.ts - last[1] <= self._carry_max_s():
+                    b.traded_total = last[0]
             elif b.token_id.endswith(LONG):
-                self._last_traded[slug] = b.traded_total
+                self._last_traded[slug] = (b.traded_total, b.ts)
             self._on_book(b)
+        self.last_message_ts = time.time()
 
     def _pick_ws(self, slugs: list[str]) -> list[str]:
         """The markets to stream: the ones already streaming that are still wanted (every re-subscription loses
-        trade prints), then the first of `slugs` (the universe's own order: busiest or deepest first)."""
+        trade prints), then the first of `slugs` (the universe's own order)."""
         s = self.cfg.secrets
         n = self.cfg.venue_us.ws_max_markets
         if not (s.us_key_id and s.us_secret_key and n > 0):
@@ -433,22 +480,44 @@ class USMarketData:
                 keep.append(x)
         return keep[:n]
 
+    # ---- lifecycle
     def start(self, slugs: list[str]) -> None:
         self._slugs = list(dict.fromkeys(slugs))
         self._ws_slugs = self._pick_ws(self._slugs)
         self._poll_task = asyncio.create_task(self._poll_loop(), name="us-book-poll")
+        self._volume_task = (asyncio.create_task(self._volume_loop(), name="us-volume-poll")
+                             if self.cfg.venue_us.volume_poll_seconds > 0 else None)
         self._ws_task = asyncio.create_task(self._ws_loop(), name="us-ws") if self._ws_slugs else None
-        self._tasks = [t for t in (self._poll_task, self._ws_task) if t is not None]
+        self._refresh_tasks()
+
+    def _refresh_tasks(self) -> None:
+        self._tasks = [t for t in (self._poll_task, self._volume_task, self._ws_task) if t is not None]
+
+    def _revive(self) -> None:
+        """Belt and braces: a loop that ended anyway is logged and started again."""
+        for attr, factory, name in (("_poll_task", self._poll_loop, "us-book-poll"),
+                                    ("_volume_task", self._volume_loop, "us-volume-poll")):
+            t = getattr(self, attr)
+            if t is not None and t.done() and not self._stop.is_set():
+                err = None if t.cancelled() else t.exception()
+                log.error("us_feed_loop_restarted", loop=name, error=str(err)[:200])
+                setattr(self, attr, asyncio.create_task(factory(), name=name))
+        self._refresh_tasks()
 
     async def set_slugs(self, slugs: list[str]) -> None:
-        """A new universe. The poll loop picks up the new list on its next round; the stream is re-subscribed only
-        if the set of streamed markets changed."""
+        """A new universe. The poll loops pick up the new list on their next round; the stream is re-subscribed
+        only if the set of streamed markets changed."""
         slugs = list(dict.fromkeys(slugs))
-        if slugs == self._slugs:
-            return
         if self._poll_task is None:
             self.start(slugs)
             return
+        self._revive()
+        if slugs == self._slugs:
+            return
+        wanted = set(slugs)
+        for d in (self._last_traded, self._last_stream_ts, self._prev_volume):
+            for gone in [k for k in d if k not in wanted]:
+                del d[gone]
         ws = self._pick_ws(slugs)
         self._slugs = slugs
         if set(ws) == set(self._ws_slugs):
@@ -457,7 +526,7 @@ class USMarketData:
         self._ws_slugs = ws
         if ws:
             self._ws_task = asyncio.create_task(self._ws_loop(), name="us-ws")
-        self._tasks = [t for t in (self._poll_task, self._ws_task) if t is not None]
+        self._refresh_tasks()
 
     async def _stop_ws(self) -> None:
         t, self._ws_task = self._ws_task, None
@@ -489,65 +558,112 @@ class USMarketData:
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks = []
-        self._poll_task = self._ws_task = None
+        self._poll_task = self._volume_task = self._ws_task = None
         self.connected = False
 
-    def _note_volume(self, slug: str, payload: dict[str, Any]) -> bool:
-        """The counter from a bbo reply. It reaches the tape with the market's next book (see _emit_books)."""
-        v = traded_total_from_us(payload or {})
-        if v is None:
-            return False
-        self._last_traded[slug] = v
-        return True
+    async def _sleep_rest(self, t0: float, interval: float) -> None:
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=max(MIN_POLL_WAIT_S, interval - (time.time() - t0)))
+        except asyncio.TimeoutError:
+            pass
 
+    # ---- REST books
     async def _poll_loop(self) -> None:
-        u = self.cfg.venue_us
-        interval = u.book_poll_seconds
         sem = asyncio.Semaphore(4)
+        last_err: list[str] = [""]
 
-        async def book(slug: str) -> None:
+        async def book(slug: str) -> bool:
             async with sem:
                 await self._throttle.wait()
                 try:
                     data = await self.client.markets.book(slug)
+                    self.messages += 1
+                    self._emit_books(slug, data or {})
+                    return True
                 except Exception as e:
-                    log.debug("us_book_poll_failed", slug=slug, error=str(e)[:120])
-                    return
-                self.messages += 1
-                self._emit_books(slug, data or {})
+                    last_err[0] = f"{type(e).__name__}: {e}"[:160]
+                    log.debug("us_book_poll_failed", slug=slug, error=last_err[0])
+                    return False
 
-        async def volume(slug: str) -> bool:
+        while not self._stop.is_set():
+            t0 = time.time()
+            try:
+                # streamed markets come from the socket while it delivers for them; otherwise they are polled too
+                targets = [s for s in self._slugs if not self.stream_fresh(s, t0)]
+                got = await asyncio.gather(*(book(s) for s in targets), return_exceptions=True)
+                failed = sum(1 for g in got if g is not True)
+                if targets and failed > max(2, len(targets) // 10):
+                    self._warn("books", 600, "us_book_polls_failing", failed=failed, of=len(targets),
+                               error=last_err[0], hint="rate limited? is another pm process running?")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._warn("book_loop", 60, "us_book_poll_round_failed", error=str(e)[:200])
+            await self._sleep_rest(t0, self.cfg.venue_us.book_poll_seconds)
+
+    # ---- REST volume counter
+    def _note_volume(self, slug: str, payload: dict[str, Any]) -> Optional[Decimal]:
+        """The counter from a bbo reply. It reaches the tape with the market's next book (see _emit_books)."""
+        if slug not in self._slugs:
+            return None                                   # it left the universe while the reply was in flight
+        v = traded_total_from_us(payload or {})
+        if v is not None:
+            self._last_traded[slug] = (v, time.time())
+        return v
+
+    async def _volume_loop(self) -> None:
+        """Its own loop, so a slow counter endpoint never stretches the book cadence."""
+        sem = asyncio.Semaphore(2)
+        last_err: list[str] = [""]
+        sample: list[str] = [""]
+
+        async def volume(slug: str) -> tuple[str, Optional[Decimal], bool]:
             async with sem:
                 await self._throttle.wait()
                 try:
                     data = await self.client.markets.bbo(slug)
+                    if not sample[0]:
+                        sample[0] = str(data)[:240]
+                    return slug, self._note_volume(slug, data or {}), True
                 except Exception as e:
-                    log.debug("us_volume_poll_failed", slug=slug, error=str(e)[:120])
-                    return False
-                return self._note_volume(slug, data or {})
+                    last_err[0] = f"{type(e).__name__}: {e}"[:160]
+                    log.debug("us_volume_poll_failed", slug=slug, error=last_err[0])
+                    return slug, None, False
 
         while not self._stop.is_set():
             t0 = time.time()
-            slugs = list(self._slugs)
-            # streamed markets come from the socket while it is up; when it is down they are polled like the rest
-            streamed = set(self._ws_slugs) if self.connected else set()
-            jobs = [book(s) for s in slugs if s not in streamed]
-            n_book = len(jobs)
-            vol = u.volume_poll_seconds > 0 and t0 - self._last_volume_poll >= u.volume_poll_seconds
-            if vol:
-                self._last_volume_poll = t0
-                jobs += [volume(s) for s in slugs]
-            got = await asyncio.gather(*jobs)
-            if vol:
-                self._volume_rounds += 1
-                found = sum(1 for g in got[n_book:] if g)
-                if self._volume_rounds <= 3 or self._volume_rounds % 60 == 0:   # the first rounds, then hourly
-                    log.info("us_volume_counter", markets=len(slugs), with_counter=found, round=self._volume_rounds)
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=max(MIN_POLL_WAIT_S, interval - (time.time() - t0)))
-            except asyncio.TimeoutError:
-                pass
+                slugs = list(self._slugs)
+                got = [g for g in await asyncio.gather(*(volume(s) for s in slugs), return_exceptions=True)
+                       if isinstance(g, tuple)]
+                self._volume_rounds += 1
+                n = self._volume_rounds
+                found = [(s, v) for s, v, _ in got if v is not None]
+                failed = sum(1 for _, _, ok in got if not ok)
+                moved = sum(1 for s, v in found if s in self._prev_volume and v != self._prev_volume[s])
+                self._prev_volume.update(found)
+                if n <= 3 or n % 60 == 0:                 # the first rounds, then hourly
+                    log.info("us_volume_counter", markets=len(slugs), with_counter=len(found), moved=moved,
+                             failed=failed, round=n, **({"sample": sample[0]} if n == 1 else {}))
+                if slugs and len(found) < len(slugs) / 2 and (n <= 3 or n % 10 == 0):
+                    log.warning("us_volume_counter_missing",
+                                note=f"the venue's volume counter is missing on {len(slugs) - len(found)} of "
+                                     f"{len(slugs)} markets ({failed} requests failed); measure will have no "
+                                     f"trading flow for them", error=last_err[0], sample=sample[0])
+                if n == 10 and found and not any(v for v in self._prev_volume.values()) and not self._warned_still:
+                    self._warned_still = True
+                    log.warning("us_volume_counter_zero", note="the volume counter is 0 on every market")
+                if n >= 10 and found and moved == 0 and not self._warned_still:
+                    self._warned_still = True
+                    log.warning("us_volume_counter_not_moving",
+                                note=f"no market's volume counter changed in the last round of {len(found)}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._warn("volume_loop", 60, "us_volume_round_failed", error=str(e)[:200])
+            await self._sleep_rest(t0, self.cfg.venue_us.volume_poll_seconds)
 
+    # ---- stream
     async def _ws_loop(self) -> None:
         from polymarket_us.websocket import MarketsWebSocket
 
@@ -573,8 +689,9 @@ class USMarketData:
             except Exception as e:
                 log.warning("us_ws_disconnected", error=str(e)[:200], retry_in=backoff)
             finally:
-                self.connected = False
-                self._ws = None
+                if self._ws is ws:
+                    self.connected = False
+                    self._ws = None
                 try:
                     await ws.close()
                 except Exception:
@@ -585,21 +702,30 @@ class USMarketData:
             backoff = min(backoff * 2, 30.0)
 
     def _on_market_data(self, msg: dict[str, Any]) -> None:
-        payload = msg.get("marketData") or {}
-        slug = payload.get("marketSlug")
-        if not slug:
-            return
-        self.messages += 1
-        self._emit_books(slug, payload)
+        try:
+            payload = msg.get("marketData") or {}
+            slug = payload.get("marketSlug")
+            if not slug:
+                return
+            self.messages += 1
+            self._last_stream_ts[slug] = time.time()
+            self._emit_books(slug, payload)
+        except Exception as e:                            # never let one message end the SDK's reader
+            self._warn("ws_book", 60, "us_ws_book_failed", error=f"{type(e).__name__}: {e}"[:200])
 
     def _on_trade_msg(self, msg: dict[str, Any]) -> None:
-        payload = msg.get("trade") or {}
-        slug = payload.get("marketSlug")
-        if not slug:
-            return
-        self.messages += 1
-        for t in trades_from_us(slug, payload):
-            self._on_trade(t)
+        try:
+            payload = msg.get("trade") or {}
+            slug = payload.get("marketSlug")
+            if not slug:
+                return
+            self.messages += 1
+            self._last_stream_ts[slug] = time.time()
+            self.last_message_ts = time.time()
+            for t in trades_from_us(slug, payload):
+                self._on_trade(t)
+        except Exception as e:
+            self._warn("ws_trade", 60, "us_ws_trade_failed", error=f"{type(e).__name__}: {e}"[:200])
 
 
 def _slugs_in_order(token_ids_: list[str]) -> list[str]:
@@ -926,19 +1052,25 @@ class PolymarketUSVenue:
         bp = rows[0].get("buyingPower") if rows else None
         return True, f"US API auth ok buying_power={bp}"
 
-    async def list_events_raw(self, limit: int = 300) -> list[dict[str, Any]]:
-        """Active events by volume. Events carry endTime, tags and their markets."""
+    async def list_events_raw(self, limit: int = 300, params: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+        """Active events by volume. Events carry endTime, tags and their markets.
+
+        Pages advance by what came back and stop on an empty page or one with nothing new, so a venue page size
+        below 100 does not cut the listing short and an ignored offset does not loop."""
         out: list[dict[str, Any]] = []
+        seen: set[str] = set()
         offset, page = 0, 100
         while len(out) < limit:
             await self.throttle.wait()
             resp = await self.public.events.list({"limit": page, "offset": offset, "active": True, "closed": False,
-                                                  "orderBy": ["volume"], "orderDirection": "desc"})
-            rows = (resp or {}).get("events") or []
-            out.extend(rows)
-            if len(rows) < page:
+                                                  "orderBy": ["volume"], "orderDirection": "desc", **(params or {})})
+            rows = [r for r in (resp or {}).get("events") or [] if isinstance(r, dict)]
+            fresh = [r for r in rows if str(r.get("slug") or id(r)) not in seen]
+            if not fresh:
                 break
-            offset += page
+            seen.update(str(r.get("slug") or id(r)) for r in fresh)
+            out.extend(fresh)
+            offset += len(rows)
         return out[:limit]
 
     async def expand_events(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -989,10 +1121,12 @@ class PolymarketUSVenue:
 
     async def all_markets(self, limit_events: int = 300) -> list[tuple[Market, Optional[Decimal], Optional[Decimal]]]:
         """(market, hinted best bid, hinted best ask) in event order, which is the venue's volume order."""
+        return self._markets_from_events(await self.expand_events(await self.list_events_raw(limit_events)))
+
+    def _markets_from_events(self, events: list[dict[str, Any]]) -> list[tuple[Market, Optional[Decimal], Optional[Decimal]]]:
         out: list[tuple[Market, Optional[Decimal], Optional[Decimal]]] = []
         seen: set[str] = set()
         coef = self.cfg.venue_us.maker_rebate_coef
-        events = await self.expand_events(await self.list_events_raw(limit_events))
         for ev in events:
             for row in ev.get("markets") or []:
                 m = market_from_us(row, ev, maker_rebate_coef=coef)
@@ -1007,16 +1141,50 @@ class PolymarketUSVenue:
             return await self._select_for_recording()
         return await self._select_for_trading()
 
+    async def _record_events(self) -> list[dict[str, Any]]:
+        """The busiest events, interleaved with the busiest events starting soon (games). Ranked by volume alone,
+        long-running politics and season futures would crowd out the games being played today."""
+        r = self.cfg.record
+        busiest = await self.list_events_raw(r.max_events)
+        soon: list[dict[str, Any]] = []
+        if r.soon_days > 0:
+            now = datetime.now(timezone.utc)
+            lo, hi = now.timestamp() - 6 * 3600, now.timestamp() + r.soon_days * 86400
+            iso = "%Y-%m-%dT%H:%M:%SZ"
+            try:
+                listed = await self.list_events_raw(r.max_events, {
+                    "startTimeMin": datetime.fromtimestamp(lo, timezone.utc).strftime(iso),
+                    "startTimeMax": datetime.fromtimestamp(hi, timezone.utc).strftime(iso), "ended": False})
+            except Exception as e:
+                log.warning("us_soon_events_failed", error=str(e)[:200])
+                listed = []
+            for ev in listed:                             # checked here too, in case the venue ignores the filter
+                st = _dt(ev.get("startTime") or ev.get("startDate"))
+                if st is not None and lo <= st.timestamp() <= hi:
+                    soon.append(ev)
+        out: list[dict[str, Any]] = []
+        have: set[str] = set()
+        for k in range(max(len(busiest), len(soon))):
+            for ev in (soon[k:k + 1] + busiest[k:k + 1]):
+                key = str(ev.get("slug") or id(ev))
+                if key not in have:
+                    have.add(key)
+                    out.append(ev)
+        log.info("us_record_events", busiest=len(busiest), starting_soon=len(soon), events=len(out))
+        return out
+
     async def _select_for_recording(self) -> list[Market]:
-        """`pm record`: the busiest markets, sports included. Events come in the venue's volume order; their
-        markets are kept in that order, at most `record.max_markets_per_event` each so one game's many markets
-        cannot fill the list. Nothing is filtered on end date, spread or depth: those are what `measure` is
-        for. Markets must quote both sides (books are fetched in chunks until max_markets are found) and have a
-        listed price inside venue_us.prefilter_band."""
+        """`pm record`: the busiest markets, sports included. Events come in the venue's volume order, interleaved
+        with the busiest events starting within record.soon_days; their markets are kept in that order, at most
+        `record.max_markets_per_event` each so one game's many markets cannot fill the list. Nothing is filtered
+        on end date, spread or depth: those are what `measure` is for. Markets must quote both sides (books are
+        fetched in chunks until max_markets are found) and have a listed price inside venue_us.prefilter_band.
+        The first market of each event comes first, so the streamed markets (the only trade prints) come from
+        as many different events as there are stream slots."""
         r = self.cfg.record
         band = self.cfg.venue_us.prefilter_band
         excluded = {t.lower() for t in self.cfg.universe.exclude_tags}
-        rows = await self.all_markets(limit_events=r.max_events)
+        rows = self._markets_from_events(await self.expand_events(await self._record_events()))
         cands: list[Market] = []
         for m, bid, ask in rows:
             if not m.is_binary or any(t in excluded for t in m.tags):
@@ -1062,7 +1230,10 @@ class PolymarketUSVenue:
                 per_event[event_of(m)] = per_event.get(event_of(m), 0) + 1
                 m.liquidity_usd = b.bid_size_at_touch * b.best_bid + b.ask_size_at_touch * (ONE - b.best_ask)
                 selected.append(m)
-        selected.sort(key=lambda m: order[m.condition_id])           # venue order: the busiest are streamed
+        selected.sort(key=lambda m: order[m.condition_id])           # venue order...
+        leads = list({event_of(m): m for m in reversed(selected)}.values())[::-1]   # ...each event's first market
+        lead_ids = {m.condition_id for m in leads}
+        selected = leads + [m for m in selected if m.condition_id not in lead_ids]
         log.info("us_record_universe_selected", listed=len(rows), candidates=len(cands), books_fetched=fetched,
                  markets=len(selected), events=len(per_event), sports=sum(1 for m in selected if "sports" in m.tags))
         return selected
@@ -1152,15 +1323,20 @@ class PolymarketUSVenue:
             pass
 
     def streaming_tokens(self) -> set[str]:
-        """Books on the authenticated market stream are current while it is connected (the SDK's socket keeps
-        itself alive with pings); REST-polled books are refreshed by each poll instead."""
+        """Books on the authenticated market stream are current while it is connected and delivering for them
+        (the SDK's socket keeps itself alive with pings); REST-polled books are refreshed by each poll instead."""
         if not self.data or not self.data.connected:
             return set()
-        return {t for slug in self.data._ws_slugs for t in token_ids(slug)}
+        now = time.time()
+        return {t for slug in self.data._ws_slugs if self.data.stream_fresh(slug, now) for t in token_ids(slug)}
 
     @property
     def feed_connected(self) -> bool:
-        return bool(self.data and (self.data.connected or self.data.messages > 0))
+        """Connected = the stream is up, or market data arrived recently (not merely once since the start)."""
+        if not self.data:
+            return False
+        recent = max(60.0, 3 * float(self.cfg.venue_us.book_poll_seconds))
+        return bool(self.data.connected or time.time() - self.data.last_message_ts <= recent)
 
     @property
     def feed_messages(self) -> int:

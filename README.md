@@ -116,20 +116,35 @@ python -m pm --venue us measure --db data/measure_polymarket_us.sqlite --csv dat
 ```
 
 `record` trades nothing. It watches up to 200 of the busiest Polymarket US
-markets (events in the venue's volume order, at most 5 markets per event, sports
-included, no end-date, spread or depth filter) and writes their books, trade
-prints and the venue's traded-volume counter to its own tape,
-`data/measure_polymarket_us.sqlite`, with its own log next to it. The `record:`
-block of `config.yaml` sets the numbers. Books are polled every 30 s, the
-volume counter every 60 s, and the 10 busiest markets are streamed, about 10
-requests a second in all (the venue allows about 20 per IP, and every
-market-data request goes through a limit of 16 a second). Do not run the paper
-bot at the same time: they share that limit. The tape grows about 0.5-1 GB a
-day.
+markets and writes their books, trade prints and the venue's traded-volume
+counter to its own tape, `data/measure_polymarket_us.sqlite`, with its own log
+next to it (`data/measure_polymarket_us.log`). Events come in the venue's volume
+order, interleaved with the busiest events starting within 3 days (games), so
+long-running futures cannot crowd out today's games; at most 5 markets per
+event; sports included; no end-date, spread or depth filter. The `record:`
+block of `config.yaml` sets the numbers.
 
+Books are polled every 30 s and the volume counter every 60 s. The first market
+of each of the first 10 events is streamed, which needs `PM_US_KEY_ID` and
+`PM_US_SECRET_KEY` in `.env`: the stream is the only source of trade prints,
+and without prints `measure` cannot check the counter or tell buyers from
+sellers (the banner warns). That is about 10 requests a second; every
+market-data request goes through a limit of 16 a second, and the venue allows
+about 20 per IP. Do not run the paper bot at the same time, since they share
+that limit. A second `record` on the same tape is refused. The tape grows about
+0.5-1 GB a day.
+
+In the first minutes the terminal shows `us_record_universe_selected ...
+markets=... sports=...`, `us_ws_connected markets=10` and `us_volume_counter
+markets=... with_counter=...`. A `WARNING` line saying the counter is missing,
+or that polls are failing, means the recording will not be usable: stop it and
+look at the message.
+
+## Which markets can a small order actually fill in? `measure`
 
 ```bash
-python -m pm --venue us measure                      # the venue's current tape
+python -m pm --venue us measure --db data/measure_polymarket_us.sqlite   # the recorder's tape
+python -m pm --venue us measure                      # the paper bot's tape
 python -m pm --venue us measure --db data/archive_optimistic/pm_polymarket_us.sqlite --csv data/measure.csv
 ```
 
@@ -144,19 +159,32 @@ fill, so markets are ranked by the slower side.
 
 Flow comes from the venue's traded-volume counter (Polymarket US tapes recorded
 from 2026-10-18), over the time it was recorded, calibrated against trade
-prints on streamed markets that have both. The counter has no side: the split
-between sellers and buyers comes from the market's trade prints, or is taken
-as even where there are none ("sides assumed even"), which is the best case
-for a maker. A counter that goes down is not counted; one that goes down 3 or
-more times is not used. Without the counter, flow comes from trade prints,
-taken over the stretch the prints cover but never less than an hour. One taker
-order that sweeps several resting orders prints several trades at once, so
-prints on the same side less than a second apart count as one burst. Markets
-with fewer than 5 bursts are shown but not ranked. The summary counts the
-markets that fill both sides within 1 hour and within 24 hours, with sports
-shown separately. Markets with no trade data at all show only
-book churn, which is not trading, and get no fill time. Reports open tapes
-read-only and never modify them.
+prints on streamed markets that have both (each run of prints against the
+counter just before and after it; the per-market range is printed). The
+counter has no side: the split between sellers and buyers comes from the
+market's trade prints, pulled toward even when there are few, or is assumed
+even where there are too few ("sides assumed even"), which is not measured and
+can make fill times shorter or longer. Volume below the counter's highest value
+so far is not counted; a counter that goes down 3 or more times is not used; a
+restart from zero is believed only when the next reading confirms it; a counter
+that never moves anywhere on the tape is not used at all. A counter that moved
+fewer than 5 times, like fewer than 5 bursts of prints, is shown but not ranked.
+
+Without the counter, flow comes from trade prints, taken over the stretch the
+prints cover but never less than an hour. One taker order that sweeps several
+resting orders prints several trades at once, so prints on the same side less
+than a second apart count as one burst. "One tick better" uses the prints'
+spread where there are enough prints; from the counter alone it counts only
+volume between two readings while every row was 2+ ticks wide, a lower bound,
+so those times are marked `<=`.
+
+The summary counts the markets that fill both sides within 1 hour and within
+24 hours, counting only fill times no longer than the market was observed
+(`> observed` marks the others: a game may settle first), with sports and games
+(sports markets ending within 3 days, as opposed to season futures) shown
+separately. Markets with no trade data at all show only book churn, which is
+not trading, and get no fill time. Reports open tapes read-only and never
+modify them.
 
 ## Measuring whether it works: markouts
 

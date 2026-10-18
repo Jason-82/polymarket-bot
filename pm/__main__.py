@@ -100,11 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "run":
             return _run(cfg)
         if args.cmd == "record":
-            r = cfg.record
-            return _run(cfg, banner=(
-                f"Recording Polymarket US for `measure`: up to {r.max_markets} of the busiest markets "
-                f"({'sports included' if 'sports' not in {t.lower() for t in r.exclude_tags} else 'no sports'}), "
-                f"nothing is traded.\ntape: {cfg.db_file}   (Ctrl+C to stop; leave it running about a day)"))
+            return _record(cfg)
         if args.cmd == "status":
             return _status(cfg, args.since_hours, args.db)
         if args.cmd == "measure":
@@ -355,6 +351,49 @@ def _run(cfg: Config, banner: str | None = None) -> int:
         # Windows: no signal handlers; asyncio.run has already cancelled the task and awaited shutdown.
         print("\nstopped.")
     return 0
+
+
+def _lock(path: Path):
+    """An exclusive lock beside the tape for the life of the process, or None if another process holds it. Two
+    recorders on one tape would interleave their volume counters and double every trade print."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def _record(cfg: Config) -> int:
+    r = cfg.record
+    tape = Path(cfg.db_file)
+    lock = _lock(tape.with_name(tape.name + ".lock"))
+    if lock is None:
+        print(f"Another recorder is already writing {tape}. Use that one, or stop it (Ctrl+C in its window) first.")
+        return 2
+    sports = "sports included" if "sports" not in {t.lower() for t in r.exclude_tags} else "no sports"
+    lines = [f"Recording Polymarket US for `measure`: up to {r.max_markets} of the busiest markets ({sports}), "
+             f"nothing is traded.",
+             f"tape: {tape}   (Ctrl+C to stop; leave it running about a day)",
+             "Do not run the paper bot at the same time: both share the venue's request limit."]
+    s = cfg.secrets
+    if not (s.us_key_id and s.us_secret_key):
+        lines.append("WARNING: PM_US_KEY_ID / PM_US_SECRET_KEY are not in .env, so no market is streamed and no trade "
+                     "prints are recorded: measure cannot check the volume counter or tell buyers from sellers. "
+                     "Add the keys to .env and start again.")
+        log.warning("record_without_keys", note="no trade prints will be recorded")
+    try:
+        return _run(cfg, banner="\n".join(lines))
+    finally:
+        lock.close()
 
 
 def _measure(cfg: Config, args) -> int:

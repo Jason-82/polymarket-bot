@@ -82,9 +82,10 @@ class RecordConfig:
     max_markets: int = 200            # watched at once, busiest events first (the venue lists events by volume)
     max_markets_per_event: int = 5    # one game lists many markets (winner, spreads, totals)
     max_events: int = 400             # events listed per universe refresh
+    soon_days: float = 3.0            # also list the busiest events starting within this many days (games); 0 = off
     exclude_tags: list[str] = field(default_factory=list)   # sports are included
     book_poll_seconds: float = 30.0   # REST book cadence: queue size and spread are sampled, not traded on
-    book_snapshot_seconds: float = 2.0    # at most one changed-book row per market every 2 s
+    book_snapshot_seconds: float = 2.0    # changed books: rows at most every 2 s per token (|L and mirrored |S)
     book_heartbeat_seconds: float = 60.0  # and one unchanged row a minute (the tape grows ~0.5-1 GB a day)
 
 
@@ -215,6 +216,8 @@ def _build(cls, data: dict[str, Any]):
         if not hasattr(obj, k):
             continue
         current = getattr(obj, k)
+        if isinstance(current, list):            # `exclude_tags: sports` means [sports]; an empty value means []
+            v = [v] if isinstance(v, str) else list(v or [])
         if isinstance(current, Decimal):
             v = D(v)
         elif isinstance(current, bool):
